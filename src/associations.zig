@@ -2,9 +2,12 @@ const std = @import("std");
 const r4os = @import("r4os");
 const r4std = @import("r4std");
 const sdk_assoc = r4std.app_assoc;
+const handler = r4std.file_handler;
 
 pub const Config = sdk_assoc.Config;
-pub const max_open_with_items = sdk_assoc.max_apps;
+pub const Choice = handler.Choice;
+pub const ChoiceList = handler.ChoiceList;
+pub const max_open_with_items = handler.max_choices;
 
 pub fn initDefault() Config {
     return Config.initDefault();
@@ -12,7 +15,7 @@ pub fn initDefault() Config {
 
 pub fn loadFromBytes(bytes: []const u8) Config {
     var config = Config.initDefault();
-    _ = config.loadFromBytes(bytes);
+    _ = Config.loadFromBytes(&config, bytes);
     return config;
 }
 
@@ -54,6 +57,21 @@ pub fn defaultIndex(config: anytype, path: []const u8) usize {
     if (config.resolvePath(path, args[0..])) |target| {
         if (menuIndexForAppId(config, target.app_id)) |index| return index;
     }
+    return 0;
+}
+
+pub fn defaultChoiceIndex(config: *const Config, choices: *const ChoiceList, path: []const u8) usize {
+    if (sdk_assoc.extensionOfPath(path)) |extension| {
+        if (config.extensionByName(extension)) |entry| {
+            for (choices.slice(), 0..) |choice, index| switch (entry.handler_kind) {
+                .none => break,
+                .app => if (choice.kind == .application and equalsIgnoreCase(choice.handler_id, entry.appIdText())) return index,
+                .subsystem => if (choice.kind == .subsystem and equalsIgnoreCase(choice.handler_id, entry.subsystemIdText()) and
+                    equalsIgnoreCase(choice.format_id, entry.formatIdText())) return index,
+            };
+        }
+    }
+    for (choices.slice(), 0..) |choice, index| if (choice.kind == .subsystem) return index;
     return 0;
 }
 
@@ -104,15 +122,16 @@ fn asciiLower(ch: u8) u8 {
 
 test "default config maps known extensions through SDK backend" {
     var config = initDefault();
-    try std.testing.expectEqual(@as(usize, 3), appCount(&config));
+    try std.testing.expectEqual(@as(usize, 4), appCount(&config));
     try std.testing.expectEqual(@as(usize, 0), defaultIndex(&config, "C:\\AUTOEXEC.BAT"));
     try std.testing.expectEqual(@as(usize, 1), defaultIndex(&config, "D:\\IMAGE.bmp"));
-    try std.testing.expectEqual(@as(usize, 2), defaultIndex(&config, "C:\\TEMP\\TADA.WAV"));
+    try std.testing.expectEqual(@as(usize, 3), defaultIndex(&config, "C:\\TEMP\\TADA.WAV"));
     try std.testing.expectEqual(@as(usize, 0), defaultIndex(&config, "C:\\TEMP\\DATA.BIN"));
     try std.testing.expectEqualStrings("Notepad", appForMenuIndex(&config, 0).?.titleText());
     try std.testing.expectEqualStrings("Paint", appForMenuIndex(&config, 1).?.titleText());
-    try std.testing.expectEqualStrings("R4Synth", appForMenuIndex(&config, 2).?.titleText());
-    try std.testing.expect(appForMenuIndex(&config, 3) == null);
+    try std.testing.expectEqualStrings("Fonts", appForMenuIndex(&config, 2).?.titleText());
+    try std.testing.expectEqualStrings("R4Synth", appForMenuIndex(&config, 3).?.titleText());
+    try std.testing.expect(appForMenuIndex(&config, 4) == null);
     try std.testing.expectEqualStrings("[TXT]", prefix(&config, "C:\\CONFIG.R4S"));
     try std.testing.expectEqualStrings("[BMP]", prefix(&config, "D:\\IMAGE.bmp"));
     try std.testing.expectEqualStrings("[AUD]", prefix(&config, "D:\\SONG.mid"));
@@ -123,6 +142,7 @@ test "default config maps known extensions through SDK backend" {
 }
 
 test "config overrides drive Explorer menu and launch defaults" {
+    if (!r4std.initialized()) return error.SkipZigTest;
     var config = loadFromBytes(
         \\R4S_FORMAT=1
         \\SCHEMA=APPASSOC
@@ -146,6 +166,7 @@ test "config overrides drive Explorer menu and launch defaults" {
 }
 
 test "broken config keeps defaults and r4x files stay direct" {
+    if (!r4std.initialized()) return error.SkipZigTest;
     var config = loadFromBytes(
         \\R4S_FORMAT=1
         \\SCHEMA=APPASSOC

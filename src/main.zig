@@ -249,6 +249,7 @@ const App = struct {
     open_with_active: bool = false,
     open_with_index: usize = 0,
     open_with_path: [128]u8 = .{0} ** 128,
+    open_with_choices: r4std.file_handler.ChoiceList = .{},
     name_mode: NameMode = .none,
     name_input: r4os.gui.TextField(48) = .{},
     rename_source_path: [128]u8 = .{0} ** 128,
@@ -390,6 +391,7 @@ const App = struct {
         if (len > 0) {
             self.assoc_loaded_from_file = self.assoc.loadFromBytes(buffer[0..@intCast(len)]);
         }
+        _ = r4std.subsystem_runtime.load(&self.ctx.sys);
     }
 
     fn updateHostedMetrics(self: *App, info: r4os.abi.GuiWindowInfo) void {
@@ -1300,14 +1302,7 @@ const App = struct {
             self.openShortcut(entry);
             return;
         }
-        var args_buf: [128]u8 = .{0} ** 128;
-        if (self.assoc.resolvePath(spanZ(entry.path[0..]), args_buf[0..])) |target| {
-            self.launchTarget(target);
-            return;
-        } else {
-            self.beginOpenWithFor(entry);
-            return;
-        }
+        self.openFilePath(spanZ(entry.path[0..]), entry);
     }
 
     fn beginOpenWith(self: *App) void {
@@ -1358,15 +1353,44 @@ const App = struct {
                 self.render();
             },
             .file => {
-                var args_buf: [128]u8 = .{0} ** 128;
-                const target = self.assoc.resolvePath(resolved.target, args_buf[0..]) orelse {
-                    setZ(self.status[0..], "Shortcut failed: no app for target");
-                    self.render();
-                    return;
-                };
-                self.launchTarget(target);
+                self.openFilePath(resolved.target, null);
             },
         }
+    }
+
+    fn openFilePath(self: *App, path: []const u8, entry: ?*const Entry) void {
+        const input = self.handlerInput(path) catch |err| {
+            setZ(self.status[0..], probeErrorStatus(err));
+            self.render();
+            return;
+        };
+        var args_buf: [r4os.subsystem_launch.max_args_bytes]u8 = undefined;
+        var resolution: r4std.file_handler.Resolution = .{};
+        r4std.file_handler.resolve(&self.assoc, r4std.subsystem_runtime.catalog(), input, args_buf[0..], &resolution) catch |err| {
+            setZ(self.status[0..], handlerErrorStatus(err));
+            self.render();
+            return;
+        };
+        switch (resolution.state) {
+            .selected => self.launchTarget(resolution.target.?),
+            .ambiguous, .unknown => {
+                if (entry) |selected_entry| {
+                    self.beginOpenWithFor(selected_entry);
+                } else {
+                    self.beginOpenWithPath(path);
+                }
+            },
+        }
+    }
+
+    fn handlerInput(self: *App, path: []const u8) r4std.subsystem_runtime.ProbeError!r4std.file_handler.Input {
+        if (r4std.app_assoc.isR4XPath(path)) return .{
+            .path = path,
+            .probe_prefix = &.{},
+            .file_size = 0,
+            .probe_window_complete = true,
+        };
+        return r4std.subsystem_runtime.probe(&self.ctx.sys, path);
     }
 
     fn shortcutOpenFailed(self: *App, err: ShortcutOpenError) void {
@@ -1376,13 +1400,32 @@ const App = struct {
     }
 
     fn beginOpenWithFor(self: *App, entry: *const Entry) void {
-        if (self.openWithCount() == 0) {
+        self.beginOpenWithPath(spanZ(entry.path[0..]));
+    }
+
+    fn beginOpenWithPath(self: *App, path: []const u8) void {
+        const input = self.handlerInput(path) catch |err| {
+            setZ(self.status[0..], probeErrorStatus(err));
+            self.render();
+            return;
+        };
+        r4std.file_handler.collectChoices(&self.assoc, r4std.subsystem_runtime.catalog(), input, &self.open_with_choices) catch |err| {
+            setZ(self.status[0..], handlerErrorStatus(err));
+            self.render();
+            return;
+        };
+        if (self.open_with_choices.count == 0) {
             setZ(self.status[0..], "No Open With handlers");
             self.render();
             return;
         }
-        copyZ(self.open_with_path[0..], spanZ(entry.path[0..]));
-        self.open_with_index = self.defaultOpenWithIndex(spanZ(entry.path[0..]));
+        if (path.len + 1 > self.open_with_path.len) {
+            setZ(self.status[0..], "Open failed: path too long");
+            self.render();
+            return;
+        }
+        copyZ(self.open_with_path[0..], path);
+        self.open_with_index = self.defaultOpenWithIndex(path);
         self.open_with_active = true;
         setZ(self.status[0..], "Choose Open With target");
         self.render();
@@ -1434,7 +1477,7 @@ const App = struct {
     }
 
     fn commitOpenWith(self: *App) void {
-        const app = self.openWithApp(self.open_with_index) orelse {
+        const choice = self.openWithChoice(self.open_with_index) orelse {
             self.closeOpenWith("Open With selection invalid");
             return;
         };
@@ -1442,35 +1485,35 @@ const App = struct {
         copyZ(path[0..], spanZ(self.open_with_path[0..]));
         self.open_with_active = false;
         @memset(self.open_with_path[0..], 0);
-        self.launchAssociatedApp(app, spanZ(path[0..]));
+        var args_buf: [r4os.subsystem_launch.max_args_bytes]u8 = undefined;
+        const target = r4std.file_handler.targetForChoice(choice, spanZ(path[0..]), args_buf[0..]) catch |err| {
+            setZ(self.status[0..], handlerErrorStatus(err));
+            self.render();
+            return;
+        };
+        self.launchTarget(target);
     }
 
     fn closeOpenWith(self: *App, message: []const u8) void {
         self.open_with_active = false;
         @memset(self.open_with_path[0..], 0);
+        self.open_with_choices = .{};
         setZ(self.status[0..], message);
         self.render();
     }
 
-    fn launchTarget(self: *App, target: r4std.app_assoc.LaunchTarget) void {
+    fn launchTarget(self: *App, target: r4std.file_handler.Target) void {
+        if (target.kind == .subsystem and !r4std.subsystem_runtime.hostPresent(&self.ctx.sys, target.app_path)) {
+            setZ(self.status[0..], "Open failed: subsystem host missing");
+            self.render();
+            return;
+        }
         var status_buf: [80]u8 = .{0} ** 80;
         const ok_status = if (target.kind == .direct_program)
             "Program launch requested"
         else
             openStatus(status_buf[0..], target.title);
         self.launchPath(target.app_path, target.args, target.policy, ok_status);
-        self.render();
-    }
-
-    fn launchAssociatedApp(self: *App, app: *const r4std.app_assoc.AppEntry, file_path: []const u8) void {
-        var args_buf: [128]u8 = .{0} ** 128;
-        const args = r4std.app_assoc.expandArgs(app.argsText(), file_path, args_buf[0..]) orelse {
-            setZ(self.status[0..], "Open failed: arguments too long");
-            self.render();
-            return;
-        };
-        var status_buf: [80]u8 = .{0} ** 80;
-        self.launchPath(app.pathText(), args, app.policy, openStatus(status_buf[0..], app.titleText()));
         self.render();
     }
 
@@ -2266,22 +2309,23 @@ const App = struct {
         const count = self.openWithCount();
         var index: usize = 0;
         while (index < count) : (index += 1) {
-            const app = self.openWithApp(index).?;
-            items[index] = .{ .text = app.titleText() };
+            const choice = self.openWithChoice(index).?;
+            items[index] = .{ .text = choice.title };
         }
         return count;
     }
 
     fn openWithCount(self: *const App) usize {
-        return file_assoc.appCount(&self.assoc);
+        return self.open_with_choices.count;
     }
 
-    fn openWithApp(self: *const App, index: usize) ?*const r4std.app_assoc.AppEntry {
-        return file_assoc.appForMenuIndex(&self.assoc, index);
+    fn openWithChoice(self: *const App, index: usize) ?r4std.file_handler.Choice {
+        if (index >= self.open_with_choices.count) return null;
+        return self.open_with_choices.items[index];
     }
 
     fn defaultOpenWithIndex(self: *const App, path: []const u8) usize {
-        return file_assoc.defaultIndex(&self.assoc, path);
+        return file_assoc.defaultChoiceIndex(&self.assoc, &self.open_with_choices, path);
     }
 
     fn menuBarRect(self: *const App) r4os.gui.Rect {
@@ -2752,6 +2796,7 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context) i32 {
     if (config.resolvePath("C:\\TEMP\\DATA.BIN", args[0..]) != null) return explorerFail(ctx, "unknown-target");
     if (!isShortcutPath("C:\\R4OS\\DESKTOP\\COMPUTER.LNK")) return explorerFail(ctx, "lnk-path");
     if (!explorerShortcutSelfTest(ctx, &config)) return 1;
+    if (!explorerSubsystemSelfTest(ctx, &config)) return 1;
 
     var src_path: [128]u8 = .{0} ** 128;
     var copy_path: [128]u8 = .{0} ** 128;
@@ -2827,6 +2872,51 @@ fn explorerShortcutSelfTest(ctx: *const r4os.r4sys.Context, config: *const r4std
     if (!expectShortcutError("R4S_FORMAT=1\nSCHEMA=R4LNK\nTITLE=Broken\n", error.MissingTarget)) return explorerFailBool(ctx, "shortcut-missing-target");
     if (!expectShortcutError("R4S_FORMAT=1\nSCHEMA=R4LNK\nTARGET=C:\\TEMP\\NOTE.TXT\nPOLICY=magic\n", error.InvalidPolicy)) return explorerFailBool(ctx, "shortcut-invalid-policy");
     if (!expectShortcutError("R4S_FORMAT=1\nSCHEMA=R4LNK\nTARGET=C:\\TEMP\\NOTE.TXT\nARGS=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", error.ArgsTooLong)) return explorerFailBool(ctx, "shortcut-args-too-long");
+    return true;
+}
+
+fn explorerSubsystemSelfTest(ctx: *const r4os.r4sys.Context, config: *const r4std.app_assoc.Config) bool {
+    if (r4std.subsystem_runtime.load(ctx) != .loaded) return explorerFailBool(ctx, "subsystem-catalog");
+    const catalog = r4std.subsystem_runtime.catalog();
+    const paths = [_][]const u8{ "C:\\TEMP\\SUBSYSTEM-A.BAS", "C:\\TEMP\\SUBSYSTEM-B.BAS" };
+    var encoded_a: [r4os.subsystem_launch.max_args_bytes]u8 = undefined;
+    var encoded_b: [r4os.subsystem_launch.max_args_bytes]u8 = undefined;
+    const encoded = [_][]u8{ encoded_a[0..], encoded_b[0..] };
+    var encoded_len: [2]usize = .{ 0, 0 };
+    for (paths, encoded, 0..) |path, storage, index| {
+        const input = r4std.subsystem_runtime.probe(ctx, path) catch return explorerFailBool(ctx, "subsystem-probe");
+        var resolution: r4std.file_handler.Resolution = .{};
+        r4std.file_handler.resolve(config, catalog, input, storage, &resolution) catch return explorerFailBool(ctx, "subsystem-resolve");
+        const target = resolution.target orelse return explorerFailBool(ctx, "subsystem-target");
+        if (target.kind != .subsystem or !equalsIgnoreCase(target.handler_id, "test.basic")) return explorerFailBool(ctx, "subsystem-id");
+        if (!r4std.subsystem_runtime.hostPresent(ctx, target.app_path)) return explorerFailBool(ctx, "subsystem-host");
+        const request = r4os.subsystem_launch.parse(target.args) catch return explorerFailBool(ctx, "subsystem-request");
+        if (!equalsIgnoreCase(request.guest_path, path)) return explorerFailBool(ctx, "subsystem-guest-path");
+        encoded_len[index] = target.args.len;
+    }
+    const request_a = r4os.subsystem_launch.parse(encoded_a[0..encoded_len[0]]) catch return explorerFailBool(ctx, "subsystem-instance-a");
+    const request_b = r4os.subsystem_launch.parse(encoded_b[0..encoded_len[1]]) catch return explorerFailBool(ctx, "subsystem-instance-b");
+    if (equalsIgnoreCase(request_a.guest_path, request_b.guest_path)) return explorerFailBool(ctx, "subsystem-instance-paths");
+
+    const input = r4std.subsystem_runtime.probe(ctx, paths[0]) catch return explorerFailBool(ctx, "subsystem-choice-probe");
+    var choices: r4std.file_handler.ChoiceList = .{};
+    r4std.file_handler.collectChoices(config, catalog, input, &choices) catch return explorerFailBool(ctx, "subsystem-choices");
+    var app_found = false;
+    var subsystem_found = false;
+    for (choices.slice()) |choice| switch (choice.kind) {
+        .application => app_found = true,
+        .subsystem => {
+            if (equalsIgnoreCase(choice.handler_id, "test.basic")) subsystem_found = true;
+        },
+    };
+    if (!app_found or !subsystem_found) return explorerFailBool(ctx, "subsystem-open-with");
+
+    var shortcut_bytes: [shortcut_file_max_bytes]u8 = undefined;
+    const link = r4std.shortcut.Shortcut.init(paths[0]) catch return explorerFailBool(ctx, "subsystem-shortcut-init");
+    const written = link.writeTo(shortcut_bytes[0..]) catch return explorerFailBool(ctx, "subsystem-shortcut-write");
+    const shortcut = r4std.shortcut.parse(written) catch return explorerFailBool(ctx, "subsystem-shortcut-parse");
+    const file = shortcut.resolve() catch return explorerFailBool(ctx, "subsystem-shortcut-resolve");
+    if (file.kind != .file or !equalsIgnoreCase(file.target, paths[0])) return explorerFailBool(ctx, "subsystem-shortcut-target");
     return true;
 }
 
@@ -2990,6 +3080,28 @@ fn launchErrorStatus(result: i32, hosted: bool) []const u8 {
         -1 => "Launch failed: app not found",
         -2 => "Launch failed: invalid app or policy",
         else => "Launch failed",
+    };
+}
+
+fn probeErrorStatus(err: r4std.subsystem_runtime.ProbeError) []const u8 {
+    return switch (err) {
+        error.InvalidPath => "Open failed: invalid or too long path",
+        error.MissingFile => "Open failed: file missing",
+        error.Directory => "Open failed: target is a directory",
+        error.ReadFailed => "Open failed: file read error",
+    };
+}
+
+fn handlerErrorStatus(err: r4std.file_handler.Error) []const u8 {
+    return switch (err) {
+        error.StaleAssociation => "Open failed: subsystem not installed",
+        error.InvalidAssociation => "Open failed: invalid association",
+        error.InvalidInput => "Open failed: invalid file input",
+        error.TooManyCandidates => "Open failed: too many subsystem matches",
+        error.TooManyChoices => "Open With has too many handlers",
+        error.BufferTooSmall => "Open failed: path too long",
+        error.InvalidGuestPath => "Open failed: invalid or too long path",
+        error.InvalidMagic, error.MalformedRecord, error.InvalidKey, error.InvalidValue, error.MissingGuest, error.DuplicateGuest, error.TooManyOptions => "Open failed: invalid subsystem launch request",
     };
 }
 
