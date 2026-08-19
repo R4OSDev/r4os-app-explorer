@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.5`
+- Version: `0.1.6`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/EXPLORER.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -13,7 +13,9 @@ The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
 File opening, R4LNK file targets, and Open With share the R4STD handler
-resolver for ordinary applications and installed subsystem R4X hosts.
+resolver for ordinary applications and installed subsystem R4X hosts. The
+shipped `.BAS` default resolves to `r4os.basic`; Notepad remains available in
+the same Open With list for source editing.
 
 ## Build
 
