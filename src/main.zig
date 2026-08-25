@@ -1,5 +1,6 @@
 const r4os = @import("r4os");
 const r4std = @import("r4std");
+const std = @import("std");
 const AppApi = struct {
     sys: r4os.r4sys.Context,
     desk: r4os.r4desk.Context,
@@ -38,6 +39,14 @@ const drive_kind_ntfs: u8 = 3;
 
 fn driveBrowsable(kind: u8) bool {
     return kind == drive_kind_fat32 or kind == drive_kind_ntfs;
+}
+
+fn writeTraceId(out: *[16]u8, value: u64) void {
+    const hex = "0123456789ABCDEF";
+    for (out[0..], 0..) |*byte, index| {
+        const shift: u6 = @intCast((15 - index) * 4);
+        byte.* = hex[@as(u4, @truncate(value >> shift))];
+    }
 }
 const entry_kind_file: i32 = 0;
 const entry_kind_dir: i32 = 1;
@@ -1359,11 +1368,13 @@ const App = struct {
     }
 
     fn openFilePath(self: *App, path: []const u8, entry: ?*const Entry) void {
+        const trace_start_ns = self.ctx.sys.monotonicNanoseconds() orelse 0;
         const input = self.handlerInput(path) catch |err| {
             setZ(self.status[0..], probeErrorStatus(err));
             self.render();
             return;
         };
+        const probe_end_ns = self.ctx.sys.monotonicNanoseconds() orelse 0;
         var args_buf: [r4os.subsystem_launch.max_args_bytes]u8 = undefined;
         var resolution: r4std.file_handler.Resolution = .{};
         r4std.file_handler.resolve(&self.assoc, r4std.subsystem_runtime.catalog(), input, args_buf[0..], &resolution) catch |err| {
@@ -1371,8 +1382,16 @@ const App = struct {
             self.render();
             return;
         };
+        const resolve_end_ns = self.ctx.sys.monotonicNanoseconds() orelse 0;
         switch (resolution.state) {
-            .selected => self.launchTarget(resolution.target.?),
+            .selected => {
+                var target = resolution.target.?;
+                var trace_args: [r4os.subsystem_launch.max_args_bytes]u8 = undefined;
+                if (self.traceBasicTarget(target, path, trace_start_ns, probe_end_ns, resolve_end_ns, trace_args[0..])) |traced| {
+                    target.args = traced;
+                }
+                self.launchTarget(target);
+            },
             .ambiguous, .unknown => {
                 if (entry) |selected_entry| {
                     self.beginOpenWithFor(selected_entry);
@@ -1381,6 +1400,33 @@ const App = struct {
                 }
             },
         }
+    }
+
+    fn traceBasicTarget(
+        self: *const App,
+        target: r4std.file_handler.Target,
+        guest_path: []const u8,
+        start_ns: u64,
+        probe_end_ns: u64,
+        resolve_end_ns: u64,
+        out: []u8,
+    ) ?[]const u8 {
+        _ = self;
+        if (start_ns == 0 or probe_end_ns < start_ns or resolve_end_ns < start_ns or
+            target.kind != .subsystem or !std.ascii.eqlIgnoreCase(target.handler_id, "r4os.basic")) return null;
+        var trace_id: [16]u8 = undefined;
+        writeTraceId(&trace_id, start_ns);
+        var phases_storage: [64]u8 = undefined;
+        const phases = std.fmt.bufPrint(phases_storage[0..], "{d},{d},0", .{
+            probe_end_ns - start_ns,
+            resolve_end_ns - start_ns,
+        }) catch return null;
+        const options = [_]r4os.subsystem_launch.Option{
+            .{ .key = r4os.subsystem_launch.trace_key, .value = trace_id[0..] },
+            .{ .key = r4os.subsystem_launch.trace_mode_key, .value = r4os.subsystem_launch.trace_mode_gui },
+            .{ .key = r4os.subsystem_launch.trace_phases_key, .value = phases },
+        };
+        return r4os.subsystem_launch.encode(guest_path, &options, out) catch null;
     }
 
     fn handlerInput(self: *App, path: []const u8) r4std.subsystem_runtime.ProbeError!r4std.file_handler.Input {
