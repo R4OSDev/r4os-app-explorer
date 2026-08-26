@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.6`
+- Version: `0.1.8`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/EXPLORER.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -15,7 +15,10 @@ target, and package metadata.
 File opening, R4LNK file targets, and Open With share the R4STD handler
 resolver for ordinary applications and installed subsystem R4X hosts. The
 shipped `.BAS` default resolves to `r4os.basic`; Notepad remains available in
-the same Open With list for source editing.
+the same Open With list for source editing. An unambiguous association uses
+file metadata only. Unknown or ambiguous paths fall back to a bounded 256 KiB
+range probe, while the selected subsystem remains the sole owner of its full
+guest source load.
 
 ## Build
 

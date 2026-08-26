@@ -1369,19 +1369,15 @@ const App = struct {
 
     fn openFilePath(self: *App, path: []const u8, entry: ?*const Entry) void {
         const trace_start_ns = self.ctx.sys.monotonicNanoseconds() orelse 0;
-        const input = self.handlerInput(path) catch |err| {
-            setZ(self.status[0..], probeErrorStatus(err));
-            self.render();
-            return;
-        };
-        const probe_end_ns = self.ctx.sys.monotonicNanoseconds() orelse 0;
         var args_buf: [r4os.subsystem_launch.max_args_bytes]u8 = undefined;
         var resolution: r4std.file_handler.Resolution = .{};
-        r4std.file_handler.resolve(&self.assoc, r4std.subsystem_runtime.catalog(), input, args_buf[0..], &resolution) catch |err| {
+        var source_access: r4std.subsystem_runtime.AccessStats = .{};
+        r4std.file_handler.resolvePath(&self.ctx.sys, &self.assoc, r4std.subsystem_runtime.catalog(), path, args_buf[0..], &resolution, &source_access) catch |err| {
             setZ(self.status[0..], handlerErrorStatus(err));
             self.render();
             return;
         };
+        const probe_end_ns = self.ctx.sys.monotonicNanoseconds() orelse 0;
         const resolve_end_ns = self.ctx.sys.monotonicNanoseconds() orelse 0;
         switch (resolution.state) {
             .selected => {
@@ -1429,16 +1425,6 @@ const App = struct {
         return r4os.subsystem_launch.encode(guest_path, &options, out) catch null;
     }
 
-    fn handlerInput(self: *App, path: []const u8) r4std.subsystem_runtime.ProbeError!r4std.file_handler.Input {
-        if (r4std.app_assoc.isR4XPath(path)) return .{
-            .path = path,
-            .probe_prefix = &.{},
-            .file_size = 0,
-            .probe_window_complete = true,
-        };
-        return r4std.subsystem_runtime.probe(&self.ctx.sys, path);
-    }
-
     fn shortcutOpenFailed(self: *App, err: ShortcutOpenError) void {
         copyZ(self.status[0..], "Shortcut failed: ");
         appendZ(self.status[0..], shortcutErrorText(err));
@@ -1450,12 +1436,8 @@ const App = struct {
     }
 
     fn beginOpenWithPath(self: *App, path: []const u8) void {
-        const input = self.handlerInput(path) catch |err| {
-            setZ(self.status[0..], probeErrorStatus(err));
-            self.render();
-            return;
-        };
-        r4std.file_handler.collectChoices(&self.assoc, r4std.subsystem_runtime.catalog(), input, &self.open_with_choices) catch |err| {
+        var source_access: r4std.subsystem_runtime.AccessStats = .{};
+        r4std.file_handler.collectPathChoices(&self.ctx.sys, &self.assoc, r4std.subsystem_runtime.catalog(), path, &self.open_with_choices, &source_access) catch |err| {
             setZ(self.status[0..], handlerErrorStatus(err));
             self.render();
             return;
@@ -2929,10 +2911,15 @@ fn explorerSubsystemSelfTest(ctx: *const r4os.r4sys.Context, config: *const r4st
     var encoded_b: [r4os.subsystem_launch.max_args_bytes]u8 = undefined;
     const encoded = [_][]u8{ encoded_a[0..], encoded_b[0..] };
     var encoded_len: [2]usize = .{ 0, 0 };
+    var total_access: r4std.subsystem_runtime.AccessStats = .{};
     for (paths, encoded, 0..) |path, storage, index| {
-        const input = r4std.subsystem_runtime.probe(ctx, path) catch return explorerFailBool(ctx, "subsystem-probe");
         var resolution: r4std.file_handler.Resolution = .{};
-        r4std.file_handler.resolve(config, catalog, input, storage, &resolution) catch return explorerFailBool(ctx, "subsystem-resolve");
+        var access: r4std.subsystem_runtime.AccessStats = .{};
+        r4std.file_handler.resolvePath(ctx, config, catalog, path, storage, &resolution, &access) catch return explorerFailBool(ctx, "subsystem-resolve");
+        if (access.info_calls != 1 or access.read_calls != 0 or access.read_bytes != 0) return explorerFailBool(ctx, "subsystem-source-probe");
+        total_access.info_calls +|= access.info_calls;
+        total_access.read_calls +|= access.read_calls;
+        total_access.read_bytes +|= access.read_bytes;
         const target = resolution.target orelse return explorerFailBool(ctx, "subsystem-target");
         if (target.kind != .subsystem or !equalsIgnoreCase(target.handler_id, "test.basic")) return explorerFailBool(ctx, "subsystem-id");
         if (!r4std.subsystem_runtime.hostPresent(ctx, target.app_path)) return explorerFailBool(ctx, "subsystem-host");
@@ -2944,9 +2931,13 @@ fn explorerSubsystemSelfTest(ctx: *const r4os.r4sys.Context, config: *const r4st
     const request_b = r4os.subsystem_launch.parse(encoded_b[0..encoded_len[1]]) catch return explorerFailBool(ctx, "subsystem-instance-b");
     if (equalsIgnoreCase(request_a.guest_path, request_b.guest_path)) return explorerFailBool(ctx, "subsystem-instance-paths");
 
-    const input = r4std.subsystem_runtime.probe(ctx, paths[0]) catch return explorerFailBool(ctx, "subsystem-choice-probe");
     var choices: r4std.file_handler.ChoiceList = .{};
-    r4std.file_handler.collectChoices(config, catalog, input, &choices) catch return explorerFailBool(ctx, "subsystem-choices");
+    var choice_access: r4std.subsystem_runtime.AccessStats = .{};
+    r4std.file_handler.collectPathChoices(ctx, config, catalog, paths[0], &choices, &choice_access) catch return explorerFailBool(ctx, "subsystem-choices");
+    if (choice_access.info_calls != 1 or choice_access.read_calls != 0 or choice_access.read_bytes != 0) return explorerFailBool(ctx, "subsystem-choice-source-probe");
+    total_access.info_calls +|= choice_access.info_calls;
+    total_access.read_calls +|= choice_access.read_calls;
+    total_access.read_bytes +|= choice_access.read_bytes;
     var app_found = false;
     var subsystem_found = false;
     for (choices.slice()) |choice| switch (choice.kind) {
@@ -2963,6 +2954,15 @@ fn explorerSubsystemSelfTest(ctx: *const r4os.r4sys.Context, config: *const r4st
     const shortcut = r4std.shortcut.parse(written) catch return explorerFailBool(ctx, "subsystem-shortcut-parse");
     const file = shortcut.resolve() catch return explorerFailBool(ctx, "subsystem-shortcut-resolve");
     if (file.kind != .file or !equalsIgnoreCase(file.target, paths[0])) return explorerFailBool(ctx, "subsystem-shortcut-target");
+    ctx.print("EXPLORER BAS source-probe: cases=3 info_calls=");
+    ctx.printU64(total_access.info_calls);
+    ctx.print(" read_calls=");
+    ctx.printU64(total_access.read_calls);
+    ctx.print(" read_bytes=");
+    ctx.printU64(total_access.read_bytes);
+    ctx.print(" limit_bytes=");
+    ctx.printU64(r4os.subsystem_catalog.max_probe_bytes);
+    ctx.println("");
     return true;
 }
 
@@ -3129,17 +3129,12 @@ fn launchErrorStatus(result: i32, hosted: bool) []const u8 {
     };
 }
 
-fn probeErrorStatus(err: r4std.subsystem_runtime.ProbeError) []const u8 {
+fn handlerErrorStatus(err: r4std.file_handler.PathError) []const u8 {
     return switch (err) {
         error.InvalidPath => "Open failed: invalid or too long path",
         error.MissingFile => "Open failed: file missing",
         error.Directory => "Open failed: target is a directory",
         error.ReadFailed => "Open failed: file read error",
-    };
-}
-
-fn handlerErrorStatus(err: r4std.file_handler.Error) []const u8 {
-    return switch (err) {
         error.StaleAssociation => "Open failed: subsystem not installed",
         error.InvalidAssociation => "Open failed: invalid association",
         error.InvalidInput => "Open failed: invalid file input",

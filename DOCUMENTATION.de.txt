@@ -45,6 +45,11 @@ Dateihandler und Subsysteme:
 - Doppelklick, Dateiziele in R4LNK-Verknuepfungen und `Open With` verwenden
   denselben R4STD-Resolver. `Open With` mischt normale Apps mit den fuer die
   konkrete Datei passenden Subsystemen.
+- Eine eindeutige App-, Subsystem- oder Endungszuordnung benoetigt nur einen
+  `fileInfo`-Aufruf. Erst eine unbekannte oder mehrdeutige Auswahl liest per
+  `fileReadAt` ein begrenztes Inhaltsfenster von hoechstens 256 KiB. Diese
+  Probebytes leben nur waehrend der Aufloesung und werden nie an den
+  gestarteten Prozess weitergereicht.
 - Die ausgelieferte `.BAS`-Zuordnung startet `r4os.basic` mit dem Gastformat
   `basic.qbasic-source`. Notepad bleibt im selben `Open With`-Dialog als
   Bearbeitungsalternative sichtbar.
