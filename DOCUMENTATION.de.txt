@@ -53,6 +53,10 @@ Dateihandler und Subsysteme:
 - Die ausgelieferte `.BAS`-Zuordnung startet `r4os.basic` mit dem Gastformat
   `basic.qbasic-source`. Notepad bleibt im selben `Open With`-Dialog als
   Bearbeitungsalternative sichtbar.
+- Die ausgelieferten `.GB`- und `.GBC`-Zuordnungen speichern ausschliesslich
+  `r4os.gb` und `gameboy.dmg-cartridge`. Beide Endungen starten daher denselben
+  installierten Host; erst dessen vollstaendige Cartridge-Validierung
+  unterscheidet DMG-/Dual-Mode-Dateien von einer CGB-only-Cartridge.
 - Ein ausgewaehltes Subsystem wird unmittelbar vor dem Start auf eine
   vorhandene Host-R4X geprueft. Der Gastpfad wird mit dem versionierten
   `R4SUBSYS1`-Vertrag bytegleich uebergeben und jeder Aufruf erzeugt eine neue

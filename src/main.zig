@@ -2963,6 +2963,89 @@ fn explorerSubsystemSelfTest(ctx: *const r4os.r4sys.Context, config: *const r4st
     ctx.print(" limit_bytes=");
     ctx.printU64(r4os.subsystem_catalog.max_probe_bytes);
     ctx.println("");
+    return explorerGameBoySubsystemSelfTest(ctx, config);
+}
+
+fn explorerGameBoySubsystemSelfTest(ctx: *const r4os.r4sys.Context, config: *const r4std.app_assoc.Config) bool {
+    const catalog = r4std.subsystem_runtime.catalog();
+    const paths = [_][]const u8{
+        "C:\\TEMP\\R4GB-E2E-A.GB",
+        "C:\\TEMP\\R4GB-E2E-B.GBC",
+        "C:\\TEMP\\R4GB-CGB-ONLY.GBC",
+    };
+    var metadata_info_calls: u64 = 0;
+    var metadata_read_calls: u64 = 0;
+    var metadata_read_bytes: u64 = 0;
+    var probe_info_calls: u64 = 0;
+    var probe_read_calls: u64 = 0;
+    var probe_read_bytes: u64 = 0;
+    for (paths) |path| {
+        var args_storage: [r4os.subsystem_launch.max_args_bytes]u8 = undefined;
+        var resolution: r4std.file_handler.Resolution = .{};
+        var access: r4std.subsystem_runtime.AccessStats = .{};
+        r4std.file_handler.resolvePath(ctx, config, catalog, path, args_storage[0..], &resolution, &access) catch return explorerFailBool(ctx, "gameboy-assoc-resolve");
+        if (access.info_calls != 1 or access.read_calls != 0 or access.read_bytes != 0) return explorerFailBool(ctx, "gameboy-assoc-source-boundary");
+        metadata_info_calls +|= access.info_calls;
+        metadata_read_calls +|= access.read_calls;
+        metadata_read_bytes +|= access.read_bytes;
+        const target = resolution.target orelse return explorerFailBool(ctx, "gameboy-assoc-target");
+        if (target.kind != .subsystem or !equalsIgnoreCase(target.handler_id, "r4os.gb") or
+            !equalsIgnoreCase(target.format_id, "gameboy.dmg-cartridge") or
+            !equalsIgnoreCase(target.app_path, "/R4OS/SUBSYSTEMS/r4os.gb/R4GB.R4X"))
+        {
+            return explorerFailBool(ctx, "gameboy-assoc-identity");
+        }
+        const request = r4os.subsystem_launch.parse(target.args) catch return explorerFailBool(ctx, "gameboy-assoc-request");
+        if (!equalsIgnoreCase(request.guest_path, path)) return explorerFailBool(ctx, "gameboy-assoc-guest");
+
+        var inspection = r4std.subsystem_runtime.inspect(ctx, path) catch return explorerFailBool(ctx, "gameboy-probe-inspect");
+        const input = r4std.subsystem_runtime.completeProbe(ctx, inspection.input, &inspection.access) catch return explorerFailBool(ctx, "gameboy-probe-read");
+        if (inspection.access.info_calls != 1 or inspection.access.read_calls == 0 or
+            inspection.access.read_bytes == 0 or inspection.access.read_bytes > r4os.subsystem_catalog.max_probe_bytes)
+        {
+            return explorerFailBool(ctx, "gameboy-probe-boundary");
+        }
+        probe_info_calls +|= inspection.access.info_calls;
+        probe_read_calls +|= inspection.access.read_calls;
+        probe_read_bytes +|= inspection.access.read_bytes;
+        var probed: r4os.subsystem_catalog.Resolution = .{};
+        r4os.subsystem_catalog.resolve(catalog, input, .{}, &probed) catch return explorerFailBool(ctx, "gameboy-probe-resolve");
+        const probe_target = probed.selected() orelse return explorerFailBool(ctx, "gameboy-probe-target");
+        if (!equalsIgnoreCase(probe_target.subsystem_id, "r4os.gb") or
+            !equalsIgnoreCase(probe_target.format_id, "gameboy.dmg-cartridge") or
+            probe_target.evidence != .confirmed_probe)
+        {
+            return explorerFailBool(ctx, "gameboy-probe-identity");
+        }
+    }
+
+    var choices: r4std.file_handler.ChoiceList = .{};
+    var choice_access: r4std.subsystem_runtime.AccessStats = .{};
+    r4std.file_handler.collectPathChoices(ctx, config, catalog, paths[0], &choices, &choice_access) catch return explorerFailBool(ctx, "gameboy-open-with");
+    if (choice_access.info_calls != 1 or choice_access.read_calls != 0 or choice_access.read_bytes != 0) return explorerFailBool(ctx, "gameboy-open-with-source-boundary");
+    var found = false;
+    for (choices.slice()) |choice| if (choice.kind == .subsystem and
+        equalsIgnoreCase(choice.handler_id, "r4os.gb") and equalsIgnoreCase(choice.format_id, "gameboy.dmg-cartridge"))
+    {
+        found = true;
+    };
+    if (!found) return explorerFailBool(ctx, "gameboy-open-with-choice");
+
+    ctx.print("EXPLORER GB source-probe: cases=3 metadata_info_calls=");
+    ctx.printU64(metadata_info_calls);
+    ctx.print(" metadata_read_calls=");
+    ctx.printU64(metadata_read_calls);
+    ctx.print(" metadata_read_bytes=");
+    ctx.printU64(metadata_read_bytes);
+    ctx.print(" probe_info_calls=");
+    ctx.printU64(probe_info_calls);
+    ctx.print(" probe_read_calls=");
+    ctx.printU64(probe_read_calls);
+    ctx.print(" probe_read_bytes=");
+    ctx.printU64(probe_read_bytes);
+    ctx.print(" limit_bytes=");
+    ctx.printU64(r4os.subsystem_catalog.max_probe_bytes);
+    ctx.println("");
     return true;
 }
 
