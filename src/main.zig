@@ -232,8 +232,12 @@ const LoadedIconImage = struct {
 
 pub fn r4_app_main(r4_app: *r4os.App) i32 {
     if (!r4std.init(r4_app.startContext())) return r4os.abi.err_no_group;
+    const sys = r4_app.system();
+    // This console diagnostic needs only R4SYS and the imported R4STD helpers.
+    // Avoid acquiring unused app contexts that may be busy with unrelated SMP
+    // work before the self-test can publish its first progress marker.
+    if (hasArg(sys.argsRaw(), "/SELFTEST")) return runSelfTest(&sys);
     var ctx = AppApi.init(r4_app) orelse return r4os.abi.err_no_group;
-    if (hasArg(ctx.sys.argsRaw(), "/SELFTEST")) return runSelfTest(&ctx.sys);
     var app = App{ .ctx = &ctx };
     return app.run();
 }

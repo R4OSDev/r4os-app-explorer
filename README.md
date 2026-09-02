@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.8`
+- Version: `0.1.10`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/EXPLORER.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -19,6 +19,11 @@ the same Open With list for source editing. An unambiguous association uses
 file metadata only. Unknown or ambiguous paths fall back to a bounded 256 KiB
 range probe, while the selected subsystem remains the sole owner of its full
 guest source load.
+
+The console `/SELFTEST` path acquires only R4SYS and its imported R4STD
+helpers. It deliberately skips unused GUI, network and device contexts, so
+the association/filesystem diagnostic cannot wait behind unrelated SMP work
+during headless acceptance.
 
 ## Build
 
