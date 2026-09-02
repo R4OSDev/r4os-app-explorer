@@ -57,6 +57,12 @@ Dateihandler und Subsysteme:
   `r4os.gb` und `gameboy.dmg-cartridge`. Beide Endungen starten daher denselben
   installierten Host; erst dessen vollstaendige Cartridge-Validierung
   unterscheidet DMG-/Dual-Mode-Dateien von einer CGB-only-Cartridge.
+- Die ausgelieferten `.SFC`- und `.SMC`-Zuordnungen speichern ausschliesslich
+  `r4os.snes` und `snes.cartridge`. Da SNES-Cartridges keine universelle Magic
+  an einer festen Position besitzen, fordert der installierte Katalog fuer
+  diese Endungen absichtlich null Probebytes an. R4SNES bleibt alleiniger
+  Besitzer des vollstaendigen Loads, der variablen Headerpruefung und der
+  Firmwarediagnose.
 - Ein ausgewaehltes Subsystem wird unmittelbar vor dem Start auf eine
   vorhandene Host-R4X geprueft. Der Gastpfad wird mit dem versionierten
   `R4SUBSYS1`-Vertrag bytegleich uebergeben und jeder Aufruf erzeugt eine neue

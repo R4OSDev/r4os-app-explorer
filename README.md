@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.10`
+- Version: `0.1.11`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/EXPLORER.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -19,6 +19,12 @@ the same Open With list for source editing. An unambiguous association uses
 file metadata only. Unknown or ambiguous paths fall back to a bounded 256 KiB
 range probe, while the selected subsystem remains the sole owner of its full
 guest source load.
+
+The `.sfc` and `.smc` associations resolve only the stable `r4os.snes` and
+`snes.cartridge` IDs. Since SNES images provide no universal fixed-position
+magic, their installed catalog entry intentionally requests zero probe bytes;
+the selected R4SNES instance validates the entire cartridge and any firmware
+requirement after launch.
 
 The console `/SELFTEST` path acquires only R4SYS and its imported R4STD
 helpers. It deliberately skips unused GUI, network and device contexts, so
