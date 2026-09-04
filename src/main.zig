@@ -409,8 +409,8 @@ const App = struct {
 
     fn updateHostedMetrics(self: *App, info: r4os.abi.GuiWindowInfo) void {
         const canvas = r4os.gui.Canvas.init(&self.ctx.draw, info);
-        self.hosted_w = clampI32(canvas.w, 260, 1600);
-        self.hosted_h = clampI32(canvas.h, 180, 1000);
+        self.hosted_w = hostedExtent(canvas.w, 260);
+        self.hosted_h = hostedExtent(canvas.h, 180);
     }
 
     fn handleKey(self: *App, key: u8) void {
@@ -3867,10 +3867,13 @@ fn u64Text(out: []u8, value: u64) []const u8 {
     return out[0..count];
 }
 
-fn clampI32(value: i32, min_value: i32, max_value: i32) i32 {
-    if (value < min_value) return min_value;
-    if (value > max_value) return max_value;
-    return value;
+fn hostedExtent(value: i32, minimum: i32) i32 {
+    return @max(value, minimum);
+}
+
+test "hosted extent preserves full HD client dimensions" {
+    try std.testing.expectEqual(@as(i32, 1920), hostedExtent(1920, 260));
+    try std.testing.expectEqual(@as(i32, 1080), hostedExtent(1080, 180));
 }
 
 fn zptr(buf: []const u8) [*:0]const u8 {
