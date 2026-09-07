@@ -314,25 +314,29 @@ const App = struct {
         self.updateHostedMetrics(info);
         self.render();
 
+        var events = r4os.EventLoop.init(self.ctx.sys, self.ctx.desk, &.{});
         while (!self.quit_requested and !self.ctx.sys.programShouldClose()) {
-            var event: r4os.abi.GuiEvent = .{};
-            while (self.ctx.desk.guiPollEvent(&event) > 0) {
-                const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
-                switch (kind) {
-                    .close => return 0,
-                    .resize => {
-                        _ = self.ctx.desk.guiWindowInfo(&info);
-                        self.updateHostedMetrics(info);
-                        self.render();
-                    },
-                    .mouse_down => self.handleMouseDown(event.x, event.y, event.tick),
-                    .mouse_up => self.handleMouseUp(event.x, event.y),
-                    .mouse_move => self.handleMouseMove(event.x, event.y),
-                    .key_down => self.handleKey(@intCast(event.key & 0xFF)),
-                    else => {},
-                }
+            switch (events.wait(r4os.time_contract.timeoutForever())) {
+                .message => |message| {
+                    const event = message.guiEvent() orelse continue;
+                    const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
+                    switch (kind) {
+                        .close => return 0,
+                        .resize => {
+                            _ = self.ctx.desk.guiWindowInfo(&info);
+                            self.updateHostedMetrics(info);
+                            self.render();
+                        },
+                        .mouse_down => self.handleMouseDown(event.x, event.y, event.tick),
+                        .mouse_up => self.handleMouseUp(event.x, event.y),
+                        .mouse_move => self.handleMouseMove(event.x, event.y),
+                        .key_down => self.handleKey(@intCast(event.key & 0xFF)),
+                        else => {},
+                    }
+                },
+                .failure => |raw| return raw,
+                .timed_out => {},
             }
-            self.ctx.sys.sleepTicks(3);
         }
         return 0;
     }
