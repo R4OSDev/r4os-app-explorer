@@ -250,6 +250,8 @@ const App = struct {
     selected_index: usize = no_selection,
     scroll_offset: usize = 0,
     page_start_index: u32 = 2,
+    loaded_location: HistoryEntry = .{},
+    directory_load_ok: bool = true,
     has_prev_page: bool = false,
     has_more_entries: bool = false,
     pending_delete: bool = false,
@@ -1193,42 +1195,103 @@ const App = struct {
         _ = line;
     }
 
+    const PageDirection = enum { first, refresh, next, previous };
+    const PageOrder = struct { app: *const App, reverse: bool };
+
+    fn pageLess(order: PageOrder, a: Entry, b: Entry) bool {
+        const cmp = order.app.compareEntries(a, b);
+        return if (order.reverse) cmp > 0 else cmp < 0;
+    }
+
     fn loadDirectory(self: *App) void {
+        self.directory_load_ok = self.readDirectoryPage(.refresh);
+    }
+
+    fn directoryReadFailed(self: *App) bool {
+        self.current_path = self.loaded_location.path;
+        self.view_mode = self.loaded_location.mode;
+        setZ(self.status[0..], "Directory read failed; previous view retained");
+        return false;
+    }
+
+    fn readDirectoryPage(self: *App, direction: PageDirection) bool {
+        var selected_path: [128]u8 = .{0} ** 128;
+        if (self.selected_index < self.entry_count) selected_path = self.entries[self.selected_index].path;
         if (self.view_mode == .computer) {
             self.loadComputerView();
-            return;
+            self.sortEntries();
+            self.restoreSelection(spanZ(&selected_path));
+            return true;
         }
-        self.entry_count = 0;
-        self.selected_index = no_selection;
-        self.select_all_active = false;
+        var next = r4os.directory_page.OrderedPage(Entry, max_entries){};
+        const order = PageOrder{ .app = self, .reverse = direction == .previous };
+        const anchor: ?Entry = if (direction == .first or self.entry_count == 0 or (direction == .refresh and !self.has_prev_page)) null else self.entries[if (direction == .next) self.entry_count - 1 else 0];
+        var iterator = (r4os.Files{ .sys = self.ctx.sys }).iterate(.{
+            .ptr = zptr(self.current_path[0..]),
+            .len = @intCast(spanZ(self.current_path[0..]).len),
+        });
+        var eligible: u64 = 0;
+        var excluded: u64 = 0;
+        while (true) {
+            var path: [128]u8 = undefined;
+            const item = switch (iterator.next(&path)) {
+                .entry => |entry| entry,
+                .end => break,
+                .failure => return self.directoryReadFailed(),
+            };
+            var entry = Entry{ .kind = if (item.kind == .directory) entry_kind_dir else entry_kind_file };
+            copyZ(&entry.path, item.path);
+            copyZ(&entry.label, tailName(item.path));
+            // Name/type ordering needs shortcut titles, but full metadata
+            // is only needed for size/date ordering or the final 64 rows.
+            self.loadShortcutEntryMetadata(&entry);
+            if (self.sort_mode == .size or self.sort_mode == .modified) {
+                self.loadEntryInfo(&entry);
+                if (!entry.info_valid) return self.directoryReadFailed();
+            }
+            if (anchor) |boundary| {
+                const cmp = self.compareEntries(entry, boundary);
+                const include = switch (direction) {
+                    .first => true,
+                    .refresh => cmp >= 0,
+                    .next => cmp > 0,
+                    .previous => cmp < 0,
+                };
+                if (!include) {
+                    excluded += 1;
+                    continue;
+                }
+            }
+            eligible += 1;
+            next.offer(entry, order, pageLess);
+        }
+        if (direction == .previous) std.mem.reverse(Entry, next.entries[0..next.count]);
+        for (next.entries[0..next.count]) |*entry| if (!entry.info_valid) {
+            self.loadEntryInfo(entry);
+        };
+        // Publish only after a complete enumeration, including the unseen
+        // tail. A failed page/sort/navigation leaves every old row intact.
+        @memcpy(self.entries[0..next.count], next.entries[0..next.count]);
+        self.entry_count = next.count;
+        self.has_prev_page = if (direction == .previous) eligible > next.count else excluded != 0;
+        self.has_more_entries = if (direction == .previous) excluded != 0 else eligible > next.count;
+        self.page_start_index = switch (direction) {
+            .first => 2,
+            .refresh => self.page_start_index,
+            .next => self.page_start_index + page_stride,
+            .previous => @max(2, self.page_start_index -| page_stride),
+        };
+        self.current_drive = self.loadCurrentDriveInfo();
+        self.loaded_location = self.currentLocation();
         self.scroll_offset = 0;
         self.clearPendingDelete();
         self.clearPendingPaste();
-        self.has_prev_page = self.page_start_index > 2;
-        self.has_more_entries = false;
         self.last_click_index = no_selection;
         self.last_click_tick = 0;
-        self.current_drive = self.loadCurrentDriveInfo();
-        var index: u32 = self.page_start_index;
-        while (self.entry_count < self.entries.len) : (index += 1) {
-            var path: [128]u8 = .{0} ** 128;
-            const kind = self.ctx.sys.dirEntry(zptr(self.current_path[0..]), index, path[0 .. path.len - 1]);
-            if (kind < 0) break;
-            var entry = Entry{ .kind = kind };
-            copyZ(entry.path[0..], spanZ(path[0..]));
-            copyZ(entry.label[0..], tailName(spanZ(path[0..])));
-            self.loadEntryInfo(&entry);
-            self.loadShortcutEntryMetadata(&entry);
-            self.entries[self.entry_count] = entry;
-            self.entry_count += 1;
-        }
-        if (self.entry_count == self.entries.len) {
-            var probe: [128]u8 = .{0} ** 128;
-            self.has_more_entries = self.ctx.sys.dirEntry(zptr(self.current_path[0..]), index, probe[0 .. probe.len - 1]) >= 0;
-        }
-        self.sortEntries();
-        if (self.entry_count > 0) self.selected_index = 0;
+        self.restoreSelection(spanZ(&selected_path));
+        self.ensureSelectionVisible();
         self.updateDirectoryStatus();
+        return true;
     }
 
     fn loadComputerView(self: *App) void {
@@ -1259,6 +1322,8 @@ const App = struct {
             self.entry_count += 1;
         }
         if (self.entry_count > 0) self.selected_index = 0;
+        self.loaded_location = self.currentLocation();
+        self.directory_load_ok = true;
         self.updateComputerStatus();
     }
 
@@ -1606,9 +1671,11 @@ const App = struct {
         }
         const old = self.currentLocation();
         parentPath(self.current_path[0..]);
-        self.pushBackHistory(old);
-        self.clearForwardHistory();
         self.loadFirstDirectoryPage();
+        if (self.directory_load_ok) {
+            self.pushBackHistory(old);
+            self.clearForwardHistory();
+        }
         self.render();
     }
 
@@ -1649,55 +1716,37 @@ const App = struct {
     }
 
     fn loadFirstDirectoryPage(self: *App) void {
-        self.page_start_index = 2;
-        self.loadDirectory();
+        self.directory_load_ok = self.readDirectoryPage(.first);
     }
 
     fn nextPage(self: *App) void {
-        self.clearPendingDelete();
-        self.clearPendingPaste();
         if (!self.has_more_entries) {
             setZ(self.status[0..], "Already at last page");
-            self.render();
-            return;
-        }
-        self.page_start_index += page_stride;
-        self.loadDirectory();
+        } else self.directory_load_ok = self.readDirectoryPage(.next);
         self.render();
     }
 
     fn prevPage(self: *App) void {
-        self.clearPendingDelete();
-        self.clearPendingPaste();
-        if (self.page_start_index <= 2) {
+        if (!self.has_prev_page) {
             setZ(self.status[0..], "Already at first page");
-            self.render();
-            return;
-        }
-        if (self.page_start_index > 2 + page_stride) {
-            self.page_start_index -= page_stride;
-        } else {
-            self.page_start_index = 2;
-        }
-        self.loadDirectory();
+        } else self.directory_load_ok = self.readDirectoryPage(.previous);
         self.render();
     }
 
     fn sortBy(self: *App, mode: SortMode) void {
-        self.clearPendingDelete();
-        self.clearPendingPaste();
-        var selected_path: [128]u8 = .{0} ** 128;
-        if (self.selected_index < self.entry_count) copyZ(selected_path[0..], spanZ(self.entries[self.selected_index].path[0..]));
+        const old_mode = self.sort_mode;
+        const old_ascending = self.sort_ascending;
         if (self.sort_mode == mode) {
             self.sort_ascending = !self.sort_ascending;
         } else {
             self.sort_mode = mode;
             self.sort_ascending = true;
         }
-        self.sortEntries();
-        self.restoreSelection(spanZ(selected_path[0..]));
-        self.ensureSelectionVisible();
-        self.updateDirectoryStatus();
+        self.directory_load_ok = self.readDirectoryPage(.first);
+        if (!self.directory_load_ok) {
+            self.sort_mode = old_mode;
+            self.sort_ascending = old_ascending;
+        }
         self.render();
     }
 
@@ -1722,6 +1771,11 @@ const App = struct {
         if (dir_cmp != 0) return dir_cmp;
         var cmp = self.compareByMode(self.sort_mode, a, b);
         if (cmp == 0) cmp = compareNames(a, b);
+        if (cmp == 0) cmp = switch (std.mem.order(u8, spanZ(&a.path), spanZ(&b.path))) {
+            .lt => -1,
+            .eq => 0,
+            .gt => 1,
+        };
         if (!self.sort_ascending) cmp = -cmp;
         return cmp;
     }
@@ -1797,13 +1851,13 @@ const App = struct {
             return;
         }
         const old = self.currentLocation();
-        if (record_history) {
-            self.pushBackHistory(old);
-            self.clearForwardHistory();
-        }
         self.view_mode = .directory;
         copyZ(self.current_path[0..], spanZ(target[0..]));
         self.loadFirstDirectoryPage();
+        if (self.directory_load_ok and record_history) {
+            self.pushBackHistory(old);
+            self.clearForwardHistory();
+        }
     }
 
     fn restoreLocation(self: *App, entry: HistoryEntry) void {
@@ -1825,10 +1879,12 @@ const App = struct {
             return;
         }
         const current = self.currentLocation();
-        self.pushForwardHistory(current);
-        self.back_count -= 1;
-        const previous = self.back_history[self.back_count];
+        const previous = self.back_history[self.back_count - 1];
         self.restoreLocation(previous);
+        if (self.directory_load_ok) {
+            self.back_count -= 1;
+            self.pushForwardHistory(current);
+        }
         self.render();
     }
 
@@ -1841,10 +1897,12 @@ const App = struct {
             return;
         }
         const current = self.currentLocation();
-        self.pushBackHistory(current);
-        self.forward_count -= 1;
-        const next = self.forward_history[self.forward_count];
+        const next = self.forward_history[self.forward_count - 1];
         self.restoreLocation(next);
+        if (self.directory_load_ok) {
+            self.forward_count -= 1;
+            self.pushBackHistory(current);
+        }
         self.render();
     }
 
