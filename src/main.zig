@@ -289,6 +289,12 @@ const App = struct {
     current_path: [128]u8 = .{0} ** 128,
     status: [80]u8 = .{0} ** 80,
     entries: [max_entries]Entry = .{Entry{}} ** max_entries,
+    snapshot: r4os.directory_page.Snapshot(Entry, 16 * 1024 * 1024) = .{},
+    snapshot_path: [128]u8 = .{0} ** 128,
+    snapshot_watch: r4os.abi.DirectoryChangeCursor = .{},
+    snapshot_valid: bool = false,
+    snapshot_mode: SortMode = .name,
+    snapshot_ascending: bool = true,
     entry_count: usize = 0,
     toolbar_back_icon: LoadedIconImage = .{},
     toolbar_forward_icon: LoadedIconImage = .{},
@@ -308,6 +314,7 @@ const App = struct {
     }
 
     fn runHosted(self: *App) i32 {
+        defer self.snapshot.deinit(self.ctx.sys.allocator());
         _ = self.ctx.desk.guiSetTitle("Explorer");
         self.setExplorerMinFrameSize();
         self.init();
@@ -1223,64 +1230,81 @@ const App = struct {
             self.restoreSelection(spanZ(&selected_path));
             return true;
         }
-        var next = r4os.directory_page.OrderedPage(Entry, max_entries){};
-        const order = PageOrder{ .app = self, .reverse = direction == .previous };
-        const anchor: ?Entry = if (direction == .first or self.entry_count == 0 or (direction == .refresh and !self.has_prev_page)) null else self.entries[if (direction == .next) self.entry_count - 1 else 0];
-        var iterator = (r4os.Files{ .sys = self.ctx.sys }).iterate(.{
-            .ptr = zptr(self.current_path[0..]),
-            .len = @intCast(spanZ(self.current_path[0..]).len),
-        });
-        var eligible: u64 = 0;
-        var excluded: u64 = 0;
-        while (true) {
-            var path: [128]u8 = undefined;
-            const item = switch (iterator.next(&path)) {
-                .entry => |entry| entry,
-                .end => break,
-                .failure => return self.directoryReadFailed(),
-            };
-            var entry = Entry{ .kind = if (item.kind == .directory) entry_kind_dir else entry_kind_file };
-            copyZ(&entry.path, item.path);
-            copyZ(&entry.label, tailName(item.path));
-            // Name/type ordering needs shortcut titles, but full metadata
-            // is only needed for size/date ordering or the final 64 rows.
-            self.loadShortcutEntryMetadata(&entry);
-            if (self.sort_mode == .size or self.sort_mode == .modified) {
-                self.loadEntryInfo(&entry);
-                if (!entry.info_valid) return self.directoryReadFailed();
-            }
-            if (anchor) |boundary| {
-                const cmp = self.compareEntries(entry, boundary);
-                const include = switch (direction) {
-                    .first => true,
-                    .refresh => cmp >= 0,
-                    .next => cmp > 0,
-                    .previous => cmp < 0,
-                };
-                if (!include) {
-                    excluded += 1;
-                    continue;
-                }
-            }
-            eligible += 1;
-            next.offer(entry, order, pageLess);
+        // A new candidate is private until its full EOF and mutation check.
+        // A failed allocation/read leaves the last published rows untouched.
+        var unchanged = self.snapshot_valid and std.mem.eql(u8, &self.snapshot_path, &self.current_path) and
+            self.snapshot_mode == self.sort_mode and self.snapshot_ascending == self.sort_ascending and direction != .refresh;
+        if (unchanged) {
+            var watch = self.snapshot_watch;
+            unchanged = self.ctx.sys.directoryChangePoll(&watch) == 0;
+            if (unchanged) self.snapshot_watch = watch;
         }
-        if (direction == .previous) std.mem.reverse(Entry, next.entries[0..next.count]);
-        for (next.entries[0..next.count]) |*entry| if (!entry.info_valid) {
-            self.loadEntryInfo(entry);
-        };
-        // Publish only after a complete enumeration, including the unseen
-        // tail. A failed page/sort/navigation leaves every old row intact.
-        @memcpy(self.entries[0..next.count], next.entries[0..next.count]);
-        self.entry_count = next.count;
-        self.has_prev_page = if (direction == .previous) eligible > next.count else excluded != 0;
-        self.has_more_entries = if (direction == .previous) excluded != 0 else eligible > next.count;
-        self.page_start_index = switch (direction) {
-            .first => 2,
-            .refresh => self.page_start_index,
-            .next => self.page_start_index + page_stride,
-            .previous => @max(2, self.page_start_index -| page_stride),
-        };
+        if (!unchanged) {
+            self.snapshot_valid = false;
+            const allocator = self.ctx.sys.allocator();
+            var candidate: @TypeOf(self.snapshot) = .{};
+            defer candidate.deinit(allocator);
+            var watch: r4os.abi.DirectoryChangeCursor = .{};
+            const watched = self.ctx.sys.directoryChangeBegin(zptr(&self.current_path), &watch) == 0;
+            var iterator = (r4os.Files{ .sys = self.ctx.sys }).iterate(.{
+                .ptr = zptr(&self.current_path),
+                .len = @intCast(spanZ(&self.current_path).len),
+            });
+            while (true) {
+                var path: [128]u8 = undefined;
+                const item = switch (iterator.next(&path)) {
+                    .entry => |entry| entry,
+                    .end => break,
+                    .failure => return self.directoryReadFailed(),
+                };
+                var entry = Entry{ .kind = if (item.kind == .directory) entry_kind_dir else entry_kind_file };
+                copyZ(&entry.path, item.path);
+                copyZ(&entry.label, tailName(item.path));
+                if (item.info) |info| {
+                    entry.info_valid = true;
+                    entry.attr = info.attr;
+                    entry.size = info.size;
+                    entry.first_cluster = info.first_cluster;
+                    entry.modified_time = info.modified_time;
+                    entry.modified_date = info.modified_date;
+                } else self.loadEntryInfo(&entry);
+                if (!entry.info_valid) return self.directoryReadFailed();
+                self.loadShortcutEntryMetadata(&entry);
+                candidate.append(allocator, entry) catch return self.directoryReadFailed();
+            }
+            candidate.sort(PageOrder{ .app = self, .reverse = false }, pageLess);
+            if (watched and self.ctx.sys.directoryChangePoll(&watch) != 0) return self.directoryReadFailed();
+            self.snapshot.deinit(allocator);
+            self.snapshot = candidate;
+            candidate = .{};
+            self.snapshot_watch = watch;
+            self.snapshot_path = self.current_path;
+            self.snapshot_mode = self.sort_mode;
+            self.snapshot_ascending = self.sort_ascending;
+            self.snapshot_valid = watched; // Old ABI rebuilds on every request.
+        }
+        const all = self.snapshot.values.items;
+        var start: usize = 0;
+        const anchor: ?Entry = if (direction == .first or self.entry_count == 0 or
+            (direction == .refresh and !self.has_prev_page)) null else self.entries[if (direction == .next) self.entry_count - 1 else 0];
+        if (anchor) |boundary| {
+            var lo: usize = 0;
+            var hi = all.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const cmp = self.compareEntries(all[mid], boundary);
+                if (cmp < 0 or (direction == .next and cmp == 0)) lo = mid + 1 else hi = mid;
+            }
+            start = if (direction == .previous) lo -| max_entries else lo;
+        }
+        // A concurrent directory shrink may remove the last page entirely.
+        if (start == all.len and start != 0) start = (start - 1) / max_entries * max_entries;
+        const count = @min(max_entries, all.len - start);
+        @memcpy(self.entries[0..count], all[start..][0..count]);
+        self.entry_count = count;
+        self.has_prev_page = start != 0;
+        self.has_more_entries = start + count < all.len;
+        self.page_start_index = 2 + @as(u32, @intCast(start));
         self.current_drive = self.loadCurrentDriveInfo();
         self.loaded_location = self.currentLocation();
         self.scroll_offset = 0;

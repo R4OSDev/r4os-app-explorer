@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.17`
+- Version: `0.1.19`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/EXPLORER.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -57,3 +57,12 @@ Detailed German technical notes from the migration are preserved in
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+
+Directory generations (0.81.26)
+-------------------------------
+A complete bounded snapshot is sorted once per unchanged directory generation.
+Page navigation reuses it. Enumeration returns metadata with each name.
+A changed generation, read failure or allocation failure preserves the last
+complete view until a replacement succeeds; no partial success is published.
+Each snapshot is limited to 16 MB, with temporary overlap during replacement.
