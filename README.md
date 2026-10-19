@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.21`
+- Version: `0.1.22`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/EXPLORER.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -31,13 +31,21 @@ helpers. It deliberately skips unused GUI, network and device contexts, so
 the association/filesystem diagnostic cannot wait behind unrelated SMP work
 during headless acceptance.
 
+`/SELFTEST /FILES` selects the same real copy/move/delete cases without the
+independent subsystem fixtures. Probe paths include the exact process instance
+and generation. Creation is exclusive and cleanup follows actual ownership
+receipts; existing files are never removed to prepare a probe.
+`/SELFTEST /FILES /QUIET` silences successful probe text; errors remain visible
+and every file assertion still runs. Normal background
+instances declare `runtime.parallel=owned-v1` and retain one GUI producer.
+
 ## Build
 
 On Windows:
 
     Build.bat
 
-On Linux or macOS:
+On Linux:
 
     ./Build.sh
 

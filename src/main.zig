@@ -2854,7 +2854,9 @@ fn buildExplorerMenus(out: *ExplorerMenus, address_visible: bool) []const r4os.g
 }
 
 fn runSelfTest(ctx: *const r4os.r4sys.Context) i32 {
-    ctx.println("EXPLORER selftest");
+    const quiet_files = hasArg(ctx.argsRaw(), "/FILES") and hasArg(ctx.argsRaw(), "/QUIET");
+    if (!quiet_files) ctx.println("EXPLORER selftest");
+    if (hasArg(ctx.argsRaw(), "/FILES")) return runFileSelfTest(ctx);
     var config = r4std.app_assoc.Config.initDefault();
     var file_buf: [assoc_config_max_bytes]u8 = undefined;
     const len = ctx.fileRead(r4std.settings.paths.assoc, file_buf[0..]);
@@ -2919,47 +2921,77 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context) i32 {
     if (!explorerShortcutSelfTest(ctx, &config)) return 1;
     if (!explorerSubsystemSelfTest(ctx, &config)) return 1;
 
-    var src_path: [128]u8 = .{0} ** 128;
-    var copy_path: [128]u8 = .{0} ** 128;
-    var move_path: [128]u8 = .{0} ** 128;
-    setZ(src_path[0..], "C:\\EXPSRC.TXT");
-    setZ(copy_path[0..], "C:\\TEMP\\EXPCT.TXT");
-    setZ(move_path[0..], "C:\\EXPMV.TXT");
-    _ = ctx.fileDelete(zptr(src_path[0..]));
-    _ = ctx.fileDelete(zptr(copy_path[0..]));
-    _ = ctx.fileDelete(zptr(move_path[0..]));
-    if (ctx.fileWrite(zptr(src_path[0..]), "Explorer selftest source\n") <= 0) return explorerFail(ctx, "write");
-    if (ctx.fileCopy(zptr(src_path[0..]), zptr(copy_path[0..])) <= 0) return explorerFail(ctx, "copy");
-    var copied_entry: [128]u8 = .{0} ** 128;
-    if (!findDirectoryEntryPath(ctx, "C:\\TEMP", "EXPCT.TXT", copied_entry[0..])) return explorerFail(ctx, "dir-entry-child");
-    if (!startsWithIgnoreCase(spanZ(copied_entry[0..]), "C:\\TEMP\\")) return explorerFail(ctx, "dir-entry-child-prefix");
-    if (ctx.fileDelete(zptr(src_path[0..])) <= 0) return explorerFail(ctx, "delete-source");
-    if (ctx.fileMove(zptr(copy_path[0..]), zptr(move_path[0..])) <= 0) return explorerFail(ctx, "move");
-    if (ctx.fileDelete(zptr(move_path[0..])) <= 0) return explorerFail(ctx, "delete");
+    return runFileSelfTest(ctx);
+}
 
-    var multi_path_a: [128]u8 = .{0} ** 128;
-    var multi_path_b: [128]u8 = .{0} ** 128;
-    setZ(multi_path_a[0..], "C:\\TEMP\\EXPMD1.TXT");
-    setZ(multi_path_b[0..], "C:\\TEMP\\EXPMD2.TXT");
-    _ = ctx.fileDelete(zptr(multi_path_a[0..]));
-    _ = ctx.fileDelete(zptr(multi_path_b[0..]));
-    if (ctx.fileWrite(zptr(multi_path_a[0..]), "Explorer multi-delete A\n") <= 0) return explorerFail(ctx, "multi-delete-write-a");
-    if (ctx.fileWrite(zptr(multi_path_b[0..]), "Explorer multi-delete B\n") <= 0) {
-        _ = ctx.fileDelete(zptr(multi_path_a[0..]));
-        return explorerFail(ctx, "multi-delete-write-b");
+fn runFileSelfTest(ctx: *const r4os.r4sys.Context) i32 {
+    // The probe namespace belongs to this exact process generation. Never
+    // remove or overwrite an existing path in order to prepare a selftest.
+    var identity: r4os.abi.ProgramJoinHandle = .{};
+    if (ctx.threadCurrentHandle(&identity) != r4os.abi.thread_ok or identity.instance_generation == 0) return explorerFail(ctx, "identity");
+    var paths: [5][128:0]u8 = undefined;
+    const parents = [_][]const u8{ "C:\\", "C:\\TEMP\\", "C:\\", "C:\\TEMP\\", "C:\\TEMP\\" };
+    for (&paths, parents, 0..) |*path, parent, index| {
+        _ = std.fmt.bufPrintZ(path, "{s}EXP-{d}-{x}-{d}.TXT", .{ parent, identity.instance_id, identity.instance_generation, index }) catch return explorerFail(ctx, "private-path");
     }
+    const files: r4os.app_storage.Files = .{ .sys = ctx.* };
+    var owned = [_]bool{false} ** paths.len;
+    defer for (&paths, owned) |*path, present| {
+        if (present) _ = files.delete(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) });
+    };
+    for (&paths) |*path| {
+        if (files.info(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) }) != .missing) return explorerFail(ctx, "private-path-exists");
+    }
+    const src_path = &paths[0];
+    const copy_path = &paths[1];
+    const move_path = &paths[2];
+    if (!createProbeFile(files, src_path, "Explorer selftest source\n")) return explorerFail(ctx, "write");
+    owned[0] = true;
+    if (ctx.fileCopy(src_path, copy_path) <= 0) return explorerFail(ctx, "copy");
+    owned[1] = true;
+    var copied_entry: [128]u8 = .{0} ** 128;
+    const copy_name = std.mem.sliceTo(copy_path, 0)["C:\\TEMP\\".len..];
+    if (!findDirectoryEntryPath(ctx, "C:\\TEMP", copy_name, copied_entry[0..])) return explorerFail(ctx, "dir-entry-child");
+    if (!startsWithIgnoreCase(spanZ(copied_entry[0..]), "C:\\TEMP\\")) return explorerFail(ctx, "dir-entry-child-prefix");
+    if (ctx.fileDelete(src_path) <= 0) return explorerFail(ctx, "delete-source");
+    owned[0] = false;
+    if (ctx.fileMove(copy_path, move_path) <= 0) return explorerFail(ctx, "move");
+    owned[1] = false;
+    owned[2] = true;
+    if (ctx.fileDelete(move_path) <= 0) return explorerFail(ctx, "delete");
+    owned[2] = false;
+
+    const multi_path_a = &paths[3];
+    const multi_path_b = &paths[4];
+    if (!createProbeFile(files, multi_path_a, "Explorer multi-delete A\n")) return explorerFail(ctx, "multi-delete-write-a");
+    owned[3] = true;
+    if (!createProbeFile(files, multi_path_b, "Explorer multi-delete B\n")) return explorerFail(ctx, "multi-delete-write-b");
+    owned[4] = true;
     var multi_entries = [_]Entry{ .{}, .{} };
     multi_entries[0].kind = entry_kind_file;
     multi_entries[1].kind = entry_kind_file;
     copyZ(multi_entries[0].path[0..], spanZ(multi_path_a[0..]));
     copyZ(multi_entries[1].path[0..], spanZ(multi_path_b[0..]));
     const multi_delete = deleteEntries(ctx, multi_entries[0..]);
-    const residue_a = ctx.fileDelete(zptr(multi_path_a[0..]));
-    const residue_b = ctx.fileDelete(zptr(multi_path_b[0..]));
-    if (multi_delete.deleted != 2 or multi_delete.failed != 0 or residue_a > 0 or residue_b > 0) return explorerFail(ctx, "multi-delete");
+    if (multi_delete.deleted != 2 or multi_delete.failed != 0) return explorerFail(ctx, "multi-delete");
+    owned[3] = false;
+    owned[4] = false;
+    for ([_]*[128:0]u8{ multi_path_a, multi_path_b }) |path| {
+        if (files.info(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) }) != .missing) return explorerFail(ctx, "multi-delete-residue");
+    }
 
-    ctx.println("EXPLORER selftest: OK");
+    if (!(hasArg(ctx.argsRaw(), "/FILES") and hasArg(ctx.argsRaw(), "/QUIET"))) ctx.println("EXPLORER selftest: OK");
     return 0;
+}
+
+fn createProbeFile(files: r4os.app_storage.Files, path: *[128:0]u8, bytes: []const u8) bool {
+    var writer = switch (files.streamWriter(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) }, r4os.abi.file_stream_open_create)) {
+        .writer => |value| value,
+        .failure => return false,
+    };
+    if (writer.write(bytes) == .ok and writer.finish() == .ok) return true;
+    _ = writer.abort(); // The stream owner validates the exact private stage.
+    return false;
 }
 
 fn explorerShortcutSelfTest(ctx: *const r4os.r4sys.Context, config: *const r4std.app_assoc.Config) bool {
