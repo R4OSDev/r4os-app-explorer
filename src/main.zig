@@ -2231,7 +2231,7 @@ const App = struct {
         @memcpy(candidate[selection.start .. selection.start + value.len], value);
         @memcpy(candidate[selection.start + value.len .. retained + value.len], previous[selection.end..]);
         if (!self.name_input.setExact(candidate[0 .. retained + value.len])) return false;
-        self.name_input.cursor = selection.start + value.len;
+        self.name_input.cursor = r4os.grapheme.ceil(self.name_input.value(), selection.start + value.len) catch return false;
         self.name_input_valid = true;
         return true;
     }
@@ -4090,6 +4090,7 @@ fn appendZ(out: []u8, value: []const u8) void {
 }
 
 fn checkDialogText(app: *App) !void {
+    if (!r4os.gui.checkGraphemeEditing()) return error.GraphemeEditing;
     const argument = "/SKIP " ** 43 ++ "\"C:\\TEMP\\ä🙂\"";
     const parsed = explorerStartPathArg(argument) orelse return error.FullArgument;
     if (!std.mem.eql(u8, parsed, "C:\\TEMP\\ä🙂") or explorerStartPathArg("\"C:\\TEMP") != null) return error.ArgumentTruncation;

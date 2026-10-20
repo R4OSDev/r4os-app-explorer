@@ -84,3 +84,7 @@ New empty files use create-only stream admission; an existing file is preserved.
 Build.sh dialog-text-test (Build.bat on Windows) and the same-source console
 fixture Tests/DialogText /DIALOGTEST cover these owners and real Unicode rename
 with exact binary bytes. Display/font, normalization and graphemes are separate.
+
+0.85.44: Rebuilt with SDK0.64.57 and the shared R4STD Unicode17.0.0
+extended grapheme editing boundaries. Byte offsets, scalar font advances
+and grapheme clusters are distinct; no shaping or BiDi support is implied.
