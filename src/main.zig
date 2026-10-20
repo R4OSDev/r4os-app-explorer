@@ -238,6 +238,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
     // work before the self-test can publish its first progress marker.
     if (hasArg(sys.argsRaw(), "/SELFTEST")) return runSelfTest(&sys);
     var ctx = AppApi.init(r4_app) orelse return r4os.abi.err_no_group;
+    if (hasArg(sys.argsRaw(), "/DIALOGTEST")) return runDialogTextSelfTest(&ctx);
     var app = App{ .ctx = &ctx };
     return app.run();
 }
@@ -267,6 +268,7 @@ const App = struct {
     open_with_choices: r4std.file_handler.ChoiceList = .{},
     name_mode: NameMode = .none,
     name_input: r4os.gui.TextField(48) = .{},
+    name_input_valid: bool = true,
     rename_source_path: [128]u8 = .{0} ** 128,
     menubar_state: r4os.gui.MenubarState = .{},
     menu_storage: ExplorerMenus = .{},
@@ -339,7 +341,7 @@ const App = struct {
                         .mouse_down => self.handleMouseDown(event.x, event.y, event.tick),
                         .mouse_up => self.handleMouseUp(event.x, event.y),
                         .mouse_move => self.handleMouseMove(event.x, event.y),
-                        .key_down => self.handleKey(@intCast(event.key & 0xFF)),
+                        .key_down => self.handleKey(r4os.gui.eventCodepoint(event)),
                         else => {},
                     }
                 },
@@ -426,13 +428,14 @@ const App = struct {
         self.hosted_h = hostedExtent(canvas.h, 180);
     }
 
-    fn handleKey(self: *App, key: u8) void {
+    fn handleKey(self: *App, codepoint: u32) void {
+        const key: u8 = if (codepoint <= 0xff) @intCast(codepoint) else 0;
         if (self.open_with_active) {
             self.handleOpenWithKey(key);
             return;
         }
         if (self.name_mode != .none) {
-            self.handleNameDialogKey(key);
+            self.handleNameDialogKey(codepoint);
             return;
         }
         if (self.new_menu_open) {
@@ -1860,7 +1863,10 @@ const App = struct {
     fn navigateToPath(self: *App, path: []const u8, record_history: bool) void {
         if (path.len == 0) return;
         var target: [128]u8 = .{0} ** 128;
-        copyZ(target[0..], path);
+        if (!r4os.bounded_text.assignZ(&target, path)) {
+            setZ(&self.status, "Path invalid or too long; previous location retained");
+            return;
+        }
         const letter = driveRootLetter(spanZ(target[0..]));
         if (letter < 'A' or letter > 'Z') {
             setZ(self.status[0..], "Path is not a drive path");
@@ -2144,7 +2150,8 @@ const App = struct {
         }
         self.name_mode = .new_folder;
         self.name_input.clear();
-        self.name_input.set("NEWFOLDER");
+        _ = self.name_input.setExact("NEWFOLDER");
+        self.name_input_valid = true;
         self.name_input.focused = true;
         setZ(self.status[0..], "New folder name");
         self.render();
@@ -2160,7 +2167,8 @@ const App = struct {
         }
         self.name_mode = .new_file;
         self.name_input.clear();
-        self.name_input.set("NEWFILE.TXT");
+        _ = self.name_input.setExact("NEWFILE.TXT");
+        self.name_input_valid = true;
         self.name_input.focused = true;
         setZ(self.status[0..], "New file name");
         self.render();
@@ -2184,27 +2192,98 @@ const App = struct {
             self.render();
             return;
         }
+        if (!self.prepareRenameSource(spanZ(&self.entries[self.selected_index].path))) {
+            self.render();
+            return;
+        }
         self.name_mode = .rename;
-        self.name_input.clear();
-        self.name_input.set(spanZ(self.entries[self.selected_index].label[0..]));
         self.name_input.focused = true;
-        copyZ(self.rename_source_path[0..], spanZ(self.entries[self.selected_index].path[0..]));
-        setZ(self.status[0..], "Rename entry");
+        if (self.name_input_valid) setZ(&self.status, "Rename entry");
         self.render();
     }
 
-    fn handleNameDialogKey(self: *App, key: u8) void {
-        const dialog = self.nameDialog();
-        const action = dialog.keyAction(key);
-        if (action == .cancel) {
+    fn prepareRenameSource(self: *App, source: []const u8) bool {
+        if (!r4os.bounded_text.assignZ(&self.rename_source_path, source)) {
+            setZ(&self.status, "Source path invalid or too long");
+            return false;
+        }
+        self.name_input_valid = self.name_input.setExact(tailName(source));
+        if (!self.name_input_valid) setZ(&self.status, "Name too long; input retained, enter a new name");
+        return true;
+    }
+
+    fn editNameCodepoint(self: *App, codepoint: u32) bool {
+        const changed = self.name_input.handleCodepointChecked(codepoint);
+        if (changed and (codepoint >= 0x20 and !(codepoint >= 0x7f and codepoint <= 0x9f) or
+            codepoint == r4os.gui.Key.backspace or codepoint == r4os.gui.Key.delete)) self.name_input_valid = true;
+        return changed;
+    }
+
+    fn insertNameText(self: *App, value: []const u8) bool {
+        if (value.len == 0 or !r4os.bounded_text.valid(value)) return false;
+        for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+        const selection = self.name_input.selectionRange();
+        const retained = self.name_input.len - (selection.end - selection.start);
+        if (value.len >= self.name_input.buffer.len - retained) return false;
+        var candidate: [48]u8 = @splat(0);
+        const previous = self.name_input.value();
+        @memcpy(candidate[0..selection.start], previous[0..selection.start]);
+        @memcpy(candidate[selection.start .. selection.start + value.len], value);
+        @memcpy(candidate[selection.start + value.len .. retained + value.len], previous[selection.end..]);
+        if (!self.name_input.setExact(candidate[0 .. retained + value.len])) return false;
+        self.name_input.cursor = selection.start + value.len;
+        self.name_input_valid = true;
+        return true;
+    }
+
+    fn handleNameDialogKey(self: *App, codepoint: u32) void {
+        if (codepoint == r4os.gui.Key.escape) {
             self.closeNameDialog("Cancelled");
             return;
         }
-        if (action == .ok) {
+        if (codepoint == r4os.gui.Key.enter or codepoint == '\n') {
             self.commitNameDialog();
             return;
         }
-        if (self.name_input.handleClipboardKey(&self.ctx.desk, key)) self.render();
+        if (codepoint == r4os.gui.Key.ctrl_c) {
+            _ = self.name_input.copyToClipboard(&self.ctx.desk);
+        } else if (codepoint == r4os.gui.Key.ctrl_x) {
+            if (self.name_input.cutToClipboard(&self.ctx.desk)) self.name_input_valid = true;
+        } else if (codepoint == r4os.gui.Key.ctrl_v) {
+            var bytes: [r4os.abi.clipboard_max_text_bytes + 1]u8 = undefined;
+            const count = self.ctx.desk.clipboardRead(&bytes);
+            if (count <= 0 or count > bytes.len or !self.insertNameText(bytes[0..@intCast(@max(count, 0))])) {
+                setZ(&self.status, "Paste invalid or too long; input retained");
+            }
+        } else if (!self.editNameCodepoint(codepoint) and codepoint >= 0x20) {
+            setZ(&self.status, "Name full or unsupported input; previous value retained");
+        }
+        self.render();
+    }
+
+    fn executeNameOperation(self: *App, target: [*:0]const u8) i32 {
+        return switch (self.name_mode) {
+            .new_folder => self.ctx.sys.dirCreate(target),
+            .new_file => blk: {
+                // Create-only admission cannot truncate an existing file.
+                const opened = self.ctx.sys.fileStreamBegin(target, r4os.abi.file_stream_open_create);
+                if (opened != r4os.abi.file_stream_result_ok) {
+                    if (opened == r4os.abi.file_stream_error_io) {
+                        const aborted = self.ctx.sys.fileStreamAbort(target);
+                        if (aborted != r4os.abi.file_stream_result_ok and aborted != r4os.abi.file_stream_error_not_found) break :blk r4os.abi.file_stream_error_io;
+                    }
+                    break :blk opened;
+                }
+                const finished = self.ctx.sys.fileStreamFinish(target, 0, 0);
+                if (finished != r4os.abi.file_stream_result_ok) {
+                    const aborted = self.ctx.sys.fileStreamAbort(target);
+                    break :blk if (aborted == r4os.abi.file_stream_result_ok or aborted == r4os.abi.file_stream_error_not_found) finished else r4os.abi.file_stream_error_io;
+                }
+                break :blk 0;
+            },
+            .rename => self.ctx.sys.fileRename(zptr(&self.rename_source_path), target),
+            .none => r4os.abi.file_stream_error_invalid,
+        };
     }
 
     fn handleNameDialogMouse(self: *App, x: i32, y: i32) void {
@@ -2228,7 +2307,7 @@ const App = struct {
 
     fn commitNameDialog(self: *App) void {
         const name = self.name_input.value();
-        if (!validFileName(name)) {
+        if (!self.name_input_valid or !validFileName(name)) {
             setZ(self.status[0..], "Invalid name");
             self.render();
             return;
@@ -2241,12 +2320,7 @@ const App = struct {
         }
 
         const mode = self.name_mode;
-        const result = switch (mode) {
-            .new_folder => self.ctx.sys.dirCreate(zptr(target_path[0..])),
-            .new_file => self.ctx.sys.fileWrite(zptr(target_path[0..]), ""),
-            .rename => self.ctx.sys.fileRename(zptr(self.rename_source_path[0..]), zptr(target_path[0..])),
-            .none => return,
-        };
+        const result = self.executeNameOperation(zptr(&target_path));
         const ok = if (mode == .new_file) result >= 0 else result > 0;
         if (!ok) {
             self.setFsErrorStatus(fsActionForNameMode(mode), result);
@@ -2557,6 +2631,8 @@ const App = struct {
             },
             .label = "Name:",
             .value = self.name_input.value(),
+            .value_cursor = self.name_input.cursor,
+            .value_selection = r4os.gui.TextRange.normalized(self.name_input.cursor, self.name_input.selection_anchor orelse self.name_input.cursor),
             .focus_action = .select,
         };
     }
@@ -3506,20 +3582,22 @@ fn hasArg(args: [*:0]const u8, wanted: []const u8) bool {
 }
 
 fn explorerStartPathArg(args: [*:0]const u8) ?[]const u8 {
+    const all = std.mem.span(args);
     var offset: usize = 0;
-    while (offset < 256 and args[offset] != 0) {
-        while (offset < 256 and isSpace(args[offset])) : (offset += 1) {}
-        if (offset >= 256 or args[offset] == 0) return null;
-        const quoted = args[offset] == '"';
+    while (offset < all.len) {
+        while (offset < all.len and isSpace(all[offset])) : (offset += 1) {}
+        if (offset == all.len) return null;
+        const quoted = all[offset] == '"';
         if (quoted) offset += 1;
         const start = offset;
         if (quoted) {
-            while (offset < 256 and args[offset] != 0 and args[offset] != '"') : (offset += 1) {}
+            while (offset < all.len and all[offset] != '"') : (offset += 1) {}
+            if (offset == all.len) return null;
         } else {
-            while (offset < 256 and args[offset] != 0 and !isSpace(args[offset])) : (offset += 1) {}
+            while (offset < all.len and !isSpace(all[offset])) : (offset += 1) {}
         }
-        const token = args[start..offset];
-        if (quoted and offset < 256 and args[offset] == '"') offset += 1;
+        const token = all[start..offset];
+        if (quoted) offset += 1;
         if (token.len != 0 and token[0] != '/' and token[0] != '-') return token;
     }
     return null;
@@ -3867,11 +3945,11 @@ fn drawMenuText(canvas: r4os.gui.Canvas, scratch: []u8, x: i32, text: []const u8
 }
 
 fn childPath(parent: []const u8, name: []const u8, out: []u8) bool {
-    @memset(out, 0);
-    if (parent.len == 0 or name.len == 0) return false;
+    if (parent.len == 0 or name.len == 0 or !r4os.bounded_text.valid(parent) or !validFileName(name)) return false;
     const needs_sep = parent[parent.len - 1] != '\\' and parent[parent.len - 1] != '/';
     const sep_len: usize = if (needs_sep) 1 else 0;
     if (parent.len + sep_len + name.len + 1 > out.len) return false;
+    @memset(out, 0);
     @memcpy(out[0..parent.len], parent);
     var pos = parent.len;
     if (needs_sep) {
@@ -3889,26 +3967,12 @@ fn isRoot(path: []const u8) bool {
 }
 
 fn validFileName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    var dot: ?usize = null;
-    var i: usize = 0;
-    while (i < name.len) : (i += 1) {
-        const ch = name[i];
-        if (ch == '.') {
-            if (dot != null) return false;
-            dot = i;
-            continue;
-        }
-        if (!shortNameAllowed(asciiUpper(ch))) return false;
+    if (name.len == 0 or !r4os.bounded_text.valid(name) or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
+    for (name) |ch| {
+        if (ch < 0x20 or ch == 0x7f or ch == '\\' or ch == '/' or ch == ':' or ch == '*' or
+            ch == '?' or ch == '"' or ch == '<' or ch == '>' or ch == '|') return false;
     }
-    const base = if (dot) |d| name[0..d] else name;
-    const ext = if (dot) |d| name[d + 1 ..] else "";
-    if (base.len == 0 or base.len > 8 or ext.len > 3) return false;
     return true;
-}
-
-fn shortNameAllowed(ch: u8) bool {
-    return (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-' or ch == '$' or ch == '~';
 }
 
 fn tailName(path: []const u8) []const u8 {
@@ -4009,11 +4073,7 @@ fn zLen(buf: []const u8) usize {
 }
 
 fn setZ(out: []u8, value: []const u8) void {
-    @memset(out, 0);
-    if (out.len == 0) return;
-    const count = @min(value.len, out.len - 1);
-    if (count > 0) @memcpy(out[0..count], value[0..count]);
-    out[count] = 0;
+    _ = r4os.bounded_text.labelZ(out, value);
 }
 
 fn copyZ(out: []u8, value: []const u8) void {
@@ -4027,4 +4087,68 @@ fn appendZ(out: []u8, value: []const u8) void {
     if (count > 0) @memcpy(out[len .. len + count], value[0..count]);
     len += count;
     out[len] = 0;
+}
+
+fn checkDialogText(app: *App) !void {
+    const argument = "/SKIP " ** 43 ++ "\"C:\\TEMP\\ä🙂\"";
+    const parsed = explorerStartPathArg(argument) orelse return error.FullArgument;
+    if (!std.mem.eql(u8, parsed, "C:\\TEMP\\ä🙂") or explorerStartPathArg("\"C:\\TEMP") != null) return error.ArgumentTruncation;
+
+    _ = app.name_input.setExact("ä");
+    _ = app.editNameCodepoint(r4os.gui.Key.backspace);
+    _ = app.editNameCodepoint(0x20ac);
+    _ = app.editNameCodepoint(0x1f642);
+    if (!std.mem.eql(u8, app.name_input.value(), "€🙂")) return error.CodepointInput;
+    app.name_input.selectAll();
+    if (!app.insertNameText("aä🙂.TXT") or !validFileName(app.name_input.value())) return error.ExactPaste;
+    const before = app.name_input;
+    if (app.insertNameText("x" ** 48) or !std.meta.eql(before, app.name_input)) return error.PasteTruncation;
+    if (app.insertNameText("\xc1\xa1") or !std.meta.eql(before, app.name_input)) return error.InvalidPaste;
+    if (!app.prepareRenameSource("C:\\TEMP\\" ++ "€" ** 20 ++ ".TXT") or app.name_input_valid or
+        !std.meta.eql(before, app.name_input) or !std.mem.endsWith(u8, spanZ(&app.rename_source_path), "€" ** 20 ++ ".TXT")) return error.ClippedRenameSource;
+    _ = app.editNameCodepoint(r4os.gui.Key.ctrl_a);
+    _ = app.editNameCodepoint('x');
+    if (!app.name_input_valid or !std.mem.eql(u8, app.name_input.value(), "x")) return error.RenameRecovery;
+    var tiny: [8]u8 = @splat(0xa5);
+    const unchanged = tiny;
+    if (childPath("C:\\TEMP", "ä🙂", &tiny) or !std.mem.eql(u8, &tiny, &unchanged)) return error.PathMutation;
+}
+
+fn runDialogTextSelfTest(ctx: *AppApi) i32 {
+    var app = App{ .ctx = ctx };
+    checkDialogText(&app) catch |err| {
+        ctx.sys.write("EXPLORER Unicode dialog selftest FAILED: ");
+        ctx.sys.println(@errorName(err));
+        return 1;
+    };
+    const directory = "C:\\TEMP\\EXPTEXT08543";
+    if (ctx.sys.fileInfo(directory)) |_| return 1;
+    if (ctx.sys.dirCreate(directory) <= 0) return 1;
+    var original: [128]u8 = @splat(0);
+    var target: [128]u8 = @splat(0);
+    if (!childPath(directory, "oldä.TXT", &original)) return 1;
+    app.name_mode = .new_file;
+    if (app.executeNameOperation(zptr(&original)) != 0) return 1;
+    const payload = "name-bytes\x00\xff";
+    if (ctx.sys.fileWrite(zptr(&original), payload) != payload.len) return 1;
+    if (app.executeNameOperation(zptr(&original)) >= 0) return 1;
+    var data: [64]u8 = undefined;
+    if (ctx.sys.fileRead(zptr(&original), &data) != payload.len or !std.mem.eql(u8, data[0..payload.len], payload)) return 1;
+    if (!app.prepareRenameSource(spanZ(&original))) return 1;
+    app.name_input.selectAll();
+    if (!app.insertNameText("€🙂.TXT") or !validFileName(app.name_input.value()) or !childPath(directory, app.name_input.value(), &target)) return 1;
+    app.name_mode = .rename;
+    if (app.executeNameOperation(zptr(&target)) <= 0) return 1;
+    if (ctx.sys.fileInfo(zptr(&original))) |_| return 1;
+    if (ctx.sys.fileRead(zptr(&target), &data) != payload.len or !std.mem.eql(u8, data[0..payload.len], payload)) return 1;
+    if (ctx.sys.fileDelete(zptr(&target)) <= 0 or ctx.sys.dirDelete(directory) <= 0) return 1;
+    ctx.sys.println("EXPLORER Unicode dialog selftest: OK codepoints=whole paste=exact source=full create=exclusive rename=bytes cleanup=complete");
+    return 0;
+}
+
+test "EXPLORER dialog owner keeps full Unicode source and atomic bounded paste" {
+    const app = try std.testing.allocator.create(App);
+    defer std.testing.allocator.destroy(app);
+    app.* = .{ .ctx = undefined };
+    try checkDialogText(app);
 }

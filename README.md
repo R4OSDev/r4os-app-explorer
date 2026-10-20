@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.22`
+- Version: `0.1.23`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/EXPLORER.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -74,3 +74,13 @@ Page navigation reuses it. Enumeration returns metadata with each name.
 A changed generation, read failure or allocation failure preserves the last
 complete view until a replacement succeeds; no partial success is published.
 Each snapshot is limited to 16 MB, with temporary overlap during replacement.
+
+Unicode name dialogs (0.85.43): use whole codepoint events, exact preloads
+from the full path rather than a shortened label, and checked whole UTF8 paste.
+The existing48-byte name/128-byte path budgets are explicit: failure retains
+input and never invents a clipped target. Unicode scalar names are accepted
+within those budgets; invalid/control/path characters fail before mutation.
+New empty files use create-only stream admission; an existing file is preserved.
+Build.sh dialog-text-test (Build.bat on Windows) and the same-source console
+fixture Tests/DialogText /DIALOGTEST cover these owners and real Unicode rename
+with exact binary bytes. Display/font, normalization and graphemes are separate.
