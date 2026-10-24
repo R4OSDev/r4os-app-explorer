@@ -248,6 +248,8 @@ const App = struct {
     hosted_w: i32 = 420,
     hosted_h: i32 = 260,
     initialized: bool = false,
+    painted: bool = false,
+    selection_deltas: u8 = 0,
     selected_index: usize = no_selection,
     scroll_offset: usize = 0,
     page_start_index: u32 = 2,
@@ -538,6 +540,7 @@ const App = struct {
     }
 
     fn handleMouseDown(self: *App, x: i32, y: i32, tick: u64) void {
+        const had_overlay = self.new_menu_open or self.menubar_state.isOpen();
         if (self.open_with_active) {
             self.handleOpenWithMouse(x, y);
             return;
@@ -592,6 +595,8 @@ const App = struct {
             return;
         }
         if (self.iconIndexAt(x, y)) |index| {
+            const old = self.selected_index;
+            const old_all = self.select_all_active;
             const is_double = self.last_click_index == index and self.last_click_tick != 0 and tick >= self.last_click_tick and tick - self.last_click_tick <= self.ctx.sys.ticksFromMilliseconds(double_click_ms);
             if (index != self.selected_index) self.clearPendingDelete();
             self.select_all_active = false;
@@ -602,7 +607,7 @@ const App = struct {
                 self.openSelected();
             } else {
                 self.updateSelectedStatus();
-                self.render();
+                self.renderSelection(old, old_all or had_overlay, self.scroll_offset);
             }
             return;
         }
@@ -635,6 +640,7 @@ const App = struct {
     }
 
     fn render(self: *App) void {
+        self.painted = false;
         var paint = switch (r4os.app_gui.beginPaintForSize(&self.ctx.draw, self.hosted_w, self.hosted_h)) {
             .paint => |value| value,
             .failure => return,
@@ -670,7 +676,70 @@ const App = struct {
         self.drawMenuBar(canvas, scratch[0..]);
         if (self.name_mode != .none) self.drawNameDialog(canvas, scratch[0..]);
         if (self.open_with_active) self.drawOpenWithDialog(canvas, scratch[0..]);
-        _ = paint.present();
+        if (paint.present() >= 0) {
+            self.painted = true;
+            self.selection_deltas = 0;
+        }
+    }
+
+    fn renderSelection(self: *App, old: usize, old_all: bool, old_scroll: usize) void {
+        // Only selection pixels and the status text change. Scroll/resize,
+        // overlays, Select All and content changes publish a complete frame.
+        // Periodic full frames bound the retained immutable delta chain.
+        if (!self.painted or old_all or self.scroll_offset != old_scroll or
+            self.selection_deltas >= 8 or self.menubar_state.isOpen() or
+            self.new_menu_open or self.name_mode != .none or self.open_with_active)
+        {
+            self.render();
+            return;
+        }
+        var regions: [3]r4os.abi.DisplayDamageRect = undefined;
+        var cells: [2]r4os.gui.Rect = undefined;
+        var indices: [2]usize = undefined;
+        var count: usize = 0;
+        for ([_]usize{ old, self.selected_index }) |index| {
+            if (index >= self.entry_count or index < self.scroll_offset or
+                index - self.scroll_offset >= self.visibleIconCount() or
+                (count != 0 and indices[0] == index)) continue;
+            const cell = self.iconLabelRect(self.iconCellRect(index));
+            cells[count] = cell;
+            indices[count] = index;
+            regions[count] = .{ .x = cell.x, .y = cell.y, .w = @intCast(cell.w), .h = @intCast(cell.h) };
+            count += 1;
+        }
+        const status = r4os.gui.statusBarRect(.{ .x = 0, .y = 0, .w = self.hosted_w, .h = self.hosted_h });
+        regions[count] = .{ .x = status.x, .y = status.y, .w = @intCast(status.w), .h = @intCast(status.h) };
+        if (self.ctx.draw.guiFrameBeginDamage(regions[0 .. count + 1]) < 0) {
+            self.render();
+            return;
+        }
+        var paint = r4os.app_gui.PaintContext{
+            .canvas = r4os.gui.Canvas.initSize(&self.ctx.draw, self.hosted_w, self.hosted_h),
+            .transactional = true,
+        };
+        defer paint.discard();
+        var commands: [64]r4os.abi.GuiFrameCommand = undefined;
+        var resources: [16 * 1024]u8 = undefined;
+        var builder: r4os.FrameCanvas = undefined;
+        const canvas = paint.bufferedCanvas(&builder, &commands, &resources);
+        var scratch: [80]u8 = .{0} ** 80;
+        for (cells[0..count], indices[0..count]) |cell, index| {
+            _ = canvas.rect(cell, white);
+            self.drawIconEntryLabel(canvas, index, self.iconCellRect(index));
+        }
+        _ = canvas.rect(status, status_bg);
+        _ = canvas.label(.{
+            .rect = .{ .x = 8, .y = canvas.h - 15, .w = canvas.w - 16, .h = 14 },
+            .text = spanZ(self.status[0..]),
+            .fg = black,
+            .bg = status_bg,
+        }, &scratch);
+        if (paint.present() >= 0) {
+            self.selection_deltas += 1;
+        } else {
+            paint.discard();
+            self.render();
+        }
     }
 
     const ToolbarLabel = enum {
@@ -822,7 +891,6 @@ const App = struct {
         _ = scratch;
         if (index >= self.entry_count) return;
         const entry = &self.entries[index];
-        const selected = self.select_all_active or index == self.selected_index;
         const icon = r4os.gui.Rect{ .x = cell.x + @divTrunc(cell.w - 32, 2), .y = cell.y + icon_pad_y, .w = 32, .h = 32 };
         if (entry.is_shortcut) {
             self.drawShortcutIcon(canvas, icon, entry);
@@ -833,6 +901,12 @@ const App = struct {
                 else => self.drawFileIcon(canvas, icon, spanZ(entry.label[0..])),
             }
         }
+        self.drawIconEntryLabel(canvas, index, cell);
+    }
+
+    fn drawIconEntryLabel(self: *App, canvas: r4os.gui.Canvas, index: usize, cell: r4os.gui.Rect) void {
+        const entry = &self.entries[index];
+        const selected = self.select_all_active or index == self.selected_index;
         const label = self.iconLabelRect(cell);
         const formatted = icon_label.format(spanZ(entry.label[0..]), entry.kind == entry_kind_file);
         const fg = if (selected) white else black;
@@ -1981,6 +2055,8 @@ const App = struct {
 
     fn moveSelectionByKey(self: *App, key: u8) void {
         if (self.entry_count == 0) return;
+        const old_all = self.select_all_active;
+        const old_scroll = self.scroll_offset;
         self.clearPendingDelete();
         self.clearPendingPaste();
         self.select_all_active = false;
@@ -2015,7 +2091,8 @@ const App = struct {
         }
         self.ensureSelectionVisible();
         self.updateSelectedStatus();
-        if (old != self.selected_index or key == r4os.gui.Key.home or key == r4os.gui.Key.end) self.render();
+        if (old != self.selected_index or old_all or key == r4os.gui.Key.home or key == r4os.gui.Key.end)
+            self.renderSelection(old, old_all, old_scroll);
     }
 
     fn updateDirectoryStatus(self: *App) void {

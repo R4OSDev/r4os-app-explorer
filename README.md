@@ -1,10 +1,10 @@
-﻿# EXPLORER.R4X
+# EXPLORER.R4X
 
 `EXPLORER.R4X` is an independent R4OS application implemented in Zig.
 
 ## Package
 
-- Version: `0.1.23`
+- Version: see `module.R4MF`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/EXPLORER.R4X`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -88,3 +88,13 @@ with exact binary bytes. Display/font, normalization and graphemes are separate.
 0.85.44: Rebuilt with SDK0.64.57 and the shared R4STD Unicode17.0.0
 extended grapheme editing boundaries. Byte offsets, scalar font advances
 and grapheme clusters are distinct; no shaping or BiDi support is implied.
+
+Selection updates (0.87.8)
+-------------------------
+After a successful complete frame, ordinary single-selection changes publish
+only the previous/new visible labels and status bar using the existing
+immutable GUI damage contract. The toolbar, address, other icons and their
+resources remain in the prior generation. Eight delta frames at most precede
+a complete frame, bounding retained generations. Scroll, resize, overlays,
+Select All, folder/refresh operations and failed transactions use complete
+frames. A delta never acknowledges a failed complete publication.
