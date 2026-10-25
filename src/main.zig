@@ -328,6 +328,9 @@ const App = struct {
         self.render();
 
         var events = r4os.EventLoop.init(self.ctx.sys, self.ctx.desk, &.{});
+        // This loop consumes only its own window events; clipboard messages
+        // are not used here. File/directory cursors remain demand-checked.
+        events.subscriptions = 0;
         while (!self.quit_requested and !self.ctx.sys.programShouldClose()) {
             switch (events.wait(r4os.time_contract.timeoutForever())) {
                 .message => |message| {
