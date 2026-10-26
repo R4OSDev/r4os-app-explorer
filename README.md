@@ -98,3 +98,20 @@ resources remain in the prior generation. Eight delta frames at most precede
 a complete frame, bounding retained generations. Scroll, resize, overlays,
 Select All, folder/refresh operations and failed transactions use complete
 frames. A delta never acknowledges a failed complete publication.
+
+Generation-owned folder work (0.87.44)
+--------------------------------------
+Main publishes a loading frame while retaining the committed view. One copied
+BSP native worker reads bounded directory batches and advances a bounded heap
+sort. Superseded generations stop at checkpoints and remain pinned until exact
+native join. Main commits complete, validated snapshots atomically. Shortcut
+contents are resolved in a separate metadata phase after the base view is
+published, then privately resorted. Selection uses full entry identity across
+resort; stale results cannot restore an old location or repeat history actions.
+No partial unsorted rows or AP filesystem execution is introduced.
+
+Build.sh navigation-test drive-free-test dialog-text-test (Build.bat on Windows)
+checks the actual owners, sort budgets, page boundaries and selection identity.
+The same-source EXPTEXT fixture adds native joins/late-result/mutation/drain
+checks. SPECTRA CHECK DESKTOP /HOST /NAV explicitly checks real GUI input and
+close during current product work. These checks do not measure physical latency.

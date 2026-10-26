@@ -70,3 +70,22 @@ Dateihandler und Subsysteme:
 - Fehlende oder veraltete Handler, Mehrdeutigkeit, ungueltige Inventare,
   zu lange Pfade und Host-Startfehler erscheinen als sichtbarer Explorer-
   Status; unbekannte Dateien erhalten keinen stillen Fallback.
+
+Ordnernavigation seit0.87.44
+----------------------------
+Der Ladezustand wird vor Zulassung eines eigenen kopierten BSP-Threads
+publiziert. Begrenzte Verzeichnisbesuche (4 Records/Backendbudget256) und
+32 Heapwurzeln je Sortierschritt lassen den GUI-Thread weiterlaufen. Alte
+Ansicht und bestaetigter Ort bleiben bis zur atomaren Uebernahme gueltig.
+Neuere Wuensche ersetzen die Generation; Freigabe und naechste Zulassung
+warten auf den echten Native-Join. Ein done-Flag oder Timeout genuegt nicht.
+Shortcutdateien gehoeren in eine eigene Metadatenphase nach der vollstaendig
+sortierten Basisansicht. Deren unveraenderte Eintraege bleiben bis zum Join
+gepinnt. Erneute Sortierung bleibt privat, Auswahl folgt voller Identitaet,
+History wird nur mit der Basis uebernommen. Mutation/Mount/globaler Cursor
+werden vor Uebernahme in RAM geprueft; hoechstens3 konservative Neuversuche.
+Ein vorhandener vollstaendiger Snapshot bleibt auf16MB begrenzt.
+Linux: ./Build.sh; gezielt ./Build.sh navigation-test drive-free-test
+dialog-text-test. Windows verwendet dieselben Ziele ueber Build.bat.
+Native und fachliche Belege: Docs/Desktop/README.txt.44 und
+Docs/Diagnostics/Spectra.txt.44. Kein physischer Latenz-/OssiPC-Nachweis.

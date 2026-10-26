@@ -21,10 +21,14 @@ pub fn build(b: *std.Build) void {
     const binding = b.createModule(.{ .root_source_file = libraries_dep.namedLazyPath("r4std_zig_binding"), .target = b.graph.host, .optimize = .ReleaseSafe });
     binding.addImport("r4os", host);
     root.addImport("r4std", binding);
-    const cases = b.addTest(.{ .root_module = root, .filters = &.{"dialog owner"} });
+    const cases = b.addTest(.{ .root_module = root, .filters = &.{ "dialog owner", "navigation view owner" } });
     b.step("dialog-text-test", "Actual Explorer Unicode rename and bounded paste owner").dependOn(&b.addRunArtifact(cases).step);
     const free_root = b.createModule(.{ .root_source_file = b.path("src/drive_free.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     free_root.addImport("r4os", host);
     const free_cases = b.addTest(.{ .root_module = free_root });
     b.step("drive-free-test", "Actual Explorer generation and exact/unknown free-space owner").dependOn(&b.addRunArtifact(free_cases).step);
+    const navigation_root = b.createModule(.{ .root_source_file = b.path("src/navigation.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    navigation_root.addImport("r4os", host);
+    const navigation_cases = b.addTest(.{ .root_module = navigation_root });
+    b.step("navigation-test", "Bounded generation-owned directory jobs and ordering").dependOn(&b.addRunArtifact(navigation_cases).step);
 }

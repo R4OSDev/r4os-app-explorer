@@ -197,6 +197,7 @@ const Entry = struct {
     label: [56]u8 = .{0} ** 56,
     is_shortcut: bool = false,
     shortcut_valid: bool = false,
+    shortcut_known: bool = false,
     shortcut_icon: [128]u8 = .{0} ** 128,
     info_valid: bool = false,
     attr: u8 = 0,
@@ -218,6 +219,58 @@ const HistoryEntry = struct {
     mode: ViewMode = .computer,
     path: [128]u8 = .{0} ** 128,
 };
+const PageDirection = enum { first, refresh, next, previous };
+const NavHistoryAction = enum { none, push, back, forward };
+const NavigationModel = struct {
+    pub const Item = Entry;
+    pub const Config = r4std.app_assoc.Config;
+    pub const Location = HistoryEntry;
+    pub const SortMode = ThisFileSortMode;
+    pub const HistoryAction = NavHistoryAction;
+    pub const PageDirection = ThisFilePageDirection;
+
+    pub fn letter(path: *const [128]u8) u8 {
+        return driveRootLetter(spanZ(path));
+    }
+    pub fn browsable(kind: u8) bool {
+        return driveBrowsable(kind);
+    }
+    pub fn drive(info: r4os.abi.DriveInfo) Entry {
+        var entry = Entry{ .kind = entry_kind_drive, .info_valid = true, .size = info.bytes };
+        setDriveRoot(&entry.path, info.letter);
+        setDriveLabel(&entry.label, info.letter);
+        return entry;
+    }
+    pub fn item(record: *const r4os.abi.DirectoryBatchEntry) ?Entry {
+        const path = spanZ(&record.path);
+        if (path.len >= 128 or record.info.exists == 0) return null;
+        var entry = Entry{ .kind = if (record.info.is_dir != 0) entry_kind_dir else entry_kind_file, .info_valid = true, .attr = record.info.attr, .size = record.info.size, .first_cluster = record.info.first_cluster, .modified_time = record.info.modified_time, .modified_date = record.info.modified_date };
+        copyZ(&entry.path, path);
+        copyZ(&entry.label, tailName(path));
+        if (entry.kind == entry_kind_file and isShortcutPath(path)) {
+            entry.is_shortcut = true;
+            shortcutLabelFromPath(&entry.label, path);
+        }
+        return entry;
+    }
+    pub fn details(sys: *const r4os.r4sys.Context, entry: *Entry) void {
+        entry.shortcut_known = true;
+        var bytes: [shortcut_file_max_bytes]u8 = undefined;
+        const count = sys.fileRead(zptr(&entry.path), &bytes);
+        if (count <= 0) return;
+        const link = r4std.shortcut.parse(bytes[0..@intCast(count)]) catch return;
+        const resolved = link.resolve() catch return;
+        entry.shortcut_valid = true;
+        if (resolved.title.len != 0) copyZ(&entry.label, resolved.title);
+        if (resolved.icon.len != 0) copyZ(&entry.shortcut_icon, resolved.icon);
+    }
+    pub fn compare(mode: ThisFileSortMode, ascending: bool, config: *const Config, a: Entry, b: Entry) i8 {
+        return compareConfigured(mode, ascending, config, a, b);
+    }
+};
+const ThisFileSortMode = SortMode;
+const ThisFilePageDirection = PageDirection;
+pub const Navigation = @import("navigation.zig").Owner(NavigationModel);
 
 const DecodedIcon = struct {
     width: u32,
@@ -247,6 +300,12 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
 const App = struct {
     ctx: *AppApi,
     free_query: drive_free.Owner = .{},
+    navigation: Navigation = .{},
+    navigation_retries: u8 = 0,
+    display_generation: u64 = 0,
+    selection_intent_generation: u64 = 0,
+    selection_intent_path: [128]u8 = @splat(0),
+    computer_inventory_generation: u64 = 0,
     hosted_w: i32 = 420,
     hosted_h: i32 = 260,
     initialized: bool = false,
@@ -322,6 +381,7 @@ const App = struct {
 
     fn runHosted(self: *App) i32 {
         defer self.snapshot.deinit(self.ctx.sys.allocator());
+        defer self.navigation.drain(&self.ctx.sys);
         defer self.free_query.drain(&self.ctx.sys);
         _ = self.ctx.desk.guiSetTitle("Explorer");
         self.setExplorerMinFrameSize();
@@ -336,6 +396,18 @@ const App = struct {
         // are not used here. File/directory cursors remain demand-checked.
         events.subscriptions = 0;
         while (!self.quit_requested and !self.ctx.sys.programShouldClose()) {
+            if (self.pollNavigation()) self.render();
+            const navigation_was_active = if (self.navigation.job) |job| job.active else false;
+            if (self.painted and self.navigation.afterPublish(&self.ctx.sys, &self.assoc)) {
+                setZ(&self.status, "Folder work unavailable; previous view retained");
+                self.updateLocationTitle();
+                self.render();
+            }
+            if (!navigation_was_active) {
+                if (self.navigation.job) |job| if (job.active and self.navigation.current(job.key)) {
+                    _ = self.ctx.desk.guiSetTitle(if (job.phase == .base) "Explorer - Reading folder..." else "Explorer - Reading shortcut details...");
+                };
+            }
             if (self.free_query.poll(&self.ctx.sys)) |completion| {
                 if (completion.info) |free_info| self.current_drive = free_info;
                 if (self.view_mode == .directory and std.mem.eql(u8, spanZ(&self.status), spanZ(&self.directory_status))) self.updateDirectoryStatus();
@@ -351,7 +423,7 @@ const App = struct {
                 if (self.view_mode == .directory and std.mem.eql(u8, spanZ(&self.status), spanZ(&self.directory_status))) self.updateDirectoryStatus();
                 self.render();
             }
-            const wait = if (self.free_query.busy())
+            const wait = if (self.free_query.busy() or self.navigation.busy())
                 r4os.time_contract.timeoutFinite(.{ .nanoseconds = 1_000_000 })
             else
                 r4os.time_contract.timeoutForever();
@@ -695,7 +767,7 @@ const App = struct {
         _ = canvas.rect(r4os.gui.statusBarRect(canvas.bounds()), status_bg);
         _ = canvas.label(.{
             .rect = .{ .x = 8, .y = canvas.h - 15, .w = canvas.w - 16, .h = 14 },
-            .text = spanZ(self.status[0..]),
+            .text = self.navigationStatus(),
             .fg = black,
             .bg = status_bg,
         }, scratch[0..]);
@@ -756,7 +828,7 @@ const App = struct {
         _ = canvas.rect(status, status_bg);
         _ = canvas.label(.{
             .rect = .{ .x = 8, .y = canvas.h - 15, .w = canvas.w - 16, .h = 14 },
-            .text = spanZ(self.status[0..]),
+            .text = self.navigationStatus(),
             .fg = black,
             .bg = status_bg,
         }, &scratch);
@@ -1310,102 +1382,202 @@ const App = struct {
         _ = line;
     }
 
-    const PageDirection = enum { first, refresh, next, previous };
-    const PageOrder = struct { app: *const App, reverse: bool };
-
-    fn pageLess(order: PageOrder, a: Entry, b: Entry) bool {
-        const cmp = order.app.compareEntries(a, b);
-        return if (order.reverse) cmp > 0 else cmp < 0;
-    }
-
     fn loadDirectory(self: *App) void {
         self.directory_load_ok = self.readDirectoryPage(.refresh);
     }
 
-    fn directoryReadFailed(self: *App) bool {
-        self.current_path = self.loaded_location.path;
-        self.view_mode = self.loaded_location.mode;
-        setZ(self.status[0..], "Directory read failed; previous view retained");
+    fn queueNavigation(self: *App, location: HistoryEntry, mode: SortMode, ascending: bool, history: NavHistoryAction, direction: PageDirection, reset_retry: bool) void {
+        if (reset_retry) self.navigation_retries = 0;
+        self.selection_intent_generation = 0;
+        self.navigation.request(&self.ctx.sys, .{ .location = location, .mode = mode, .ascending = ascending, .history = history, .origin = self.currentLocation(), .page = direction });
+        self.directory_load_ok = false;
+        self.free_query.clear();
+        self.painted = false;
+        setZ(&self.status, "Loading folder...");
+        _ = self.ctx.desk.guiSetTitle("Explorer - Loading folder...");
+    }
+
+    fn snapshotCurrent(self: *App) bool {
+        if (!self.snapshot_valid) return false;
+        if (self.view_mode == .computer) {
+            const storage: r4os.storage.Context = .{ .sys = &self.ctx.sys };
+            var inventory: r4os.abi.StorageInventory = .{};
+            return storage.inventory(&inventory) == 0 and inventory.generation == self.computer_inventory_generation;
+        }
+        var observed = self.snapshot_watch;
+        return self.ctx.sys.directoryChangePoll(&observed) == 0 and observed.sequence == self.snapshot_watch.sequence;
+    }
+
+    fn guardCurrentEntries(self: *App) bool {
+        if (self.snapshotCurrent()) return true;
+        self.name_mode = .none;
+        self.open_with_active = false;
+        self.clearPendingDelete();
+        self.clearPendingPaste();
+        self.queueNavigation(self.currentLocation(), self.sort_mode, self.sort_ascending, .none, .refresh, true);
+        setZ(&self.status, "Folder changed; reloading before operation");
+        self.render();
         return false;
     }
 
-    fn readDirectoryPage(self: *App, direction: PageDirection) bool {
-        var selected_path: [128]u8 = .{0} ** 128;
-        if (self.selected_index < self.entry_count) selected_path = self.entries[self.selected_index].path;
+    fn updateLocationTitle(self: *App) void {
         if (self.view_mode == .computer) {
-            self.loadComputerView();
-            self.sortEntries();
-            self.restoreSelection(spanZ(&selected_path));
+            _ = self.ctx.desk.guiSetTitle("Explorer");
+            return;
+        }
+        var title: [64]u8 = @splat(0);
+        setZ(&title, "Explorer - ");
+        const name = tailName(spanZ(&self.current_path));
+        appendZ(&title, if (name.len == 0) spanZ(&self.current_path) else name);
+        _ = self.ctx.desk.guiSetTitle(zptr(&title));
+    }
+
+    fn navigationStatus(self: *const App) []const u8 {
+        if (self.navigation.loading()) return "Loading folder...";
+        if (self.navigation.job) |job| if (job.phase == .details) return "Loading shortcut details...";
+        return spanZ(&self.status);
+    }
+
+    fn pollNavigation(self: *App) bool {
+        const job = self.navigation.collectJoined(&self.ctx.sys) orelse return false;
+        if (!self.navigation.current(job.key)) {
+            Navigation.destroy(&self.ctx.sys, job);
+            return false;
+        }
+        if (job.result != .ok or !Navigation.valid(&self.ctx.sys, job)) {
+            const stale = job.result == .stale or (job.result == .ok);
+            const key = job.key;
+            Navigation.destroy(&self.ctx.sys, job);
+            if (stale and self.navigation_retries < 3) {
+                self.navigation_retries += 1;
+                self.queueNavigation(key.location, key.mode, key.ascending, key.history, key.page, false);
+            } else {
+                self.directory_load_ok = false;
+                setZ(&self.status, "Folder changed or could not be loaded; previous view retained");
+                self.updateLocationTitle();
+            }
             return true;
         }
-        // A new candidate is private until its full EOF and mutation check.
-        // A failed allocation/read leaves the last published rows untouched.
-        var unchanged = self.snapshot_valid and std.mem.eql(u8, &self.snapshot_path, &self.current_path) and
-            self.snapshot_mode == self.sort_mode and self.snapshot_ascending == self.sort_ascending and direction != .refresh;
-        if (unchanged) {
-            var watch = self.snapshot_watch;
-            unchanged = self.ctx.sys.directoryChangePoll(&watch) == 0;
-            if (unchanged) self.snapshot_watch = watch;
+        const details = job.phase == .details;
+        if (details and (self.display_generation != job.key.generation or job.source.ptr != self.snapshot.values.items.ptr or job.source.len != self.snapshot.values.items.len)) {
+            Navigation.destroy(&self.ctx.sys, job);
+            return false;
         }
-        if (!unchanged) {
-            self.snapshot_valid = false;
-            const allocator = self.ctx.sys.allocator();
-            var candidate: @TypeOf(self.snapshot) = .{};
-            defer candidate.deinit(allocator);
-            var watch: r4os.abi.DirectoryChangeCursor = .{};
-            const watched = self.ctx.sys.directoryChangeBegin(zptr(&self.current_path), &watch) == 0;
-            var iterator = (r4os.Files{ .sys = self.ctx.sys }).iterate(.{
-                .ptr = zptr(&self.current_path),
-                .len = @intCast(spanZ(&self.current_path).len),
-            });
-            while (true) {
-                var path: [128]u8 = undefined;
-                const item = switch (iterator.next(&path)) {
-                    .entry => |entry| entry,
-                    .end => break,
-                    .failure => return self.directoryReadFailed(),
-                };
-                var entry = Entry{ .kind = if (item.kind == .directory) entry_kind_dir else entry_kind_file };
-                copyZ(&entry.path, item.path);
-                copyZ(&entry.label, tailName(item.path));
-                if (item.info) |info| {
-                    entry.info_valid = true;
-                    entry.attr = info.attr;
-                    entry.size = info.size;
-                    entry.first_cluster = info.first_cluster;
-                    entry.modified_time = info.modified_time;
-                    entry.modified_date = info.modified_date;
-                } else self.loadEntryInfo(&entry);
-                if (!entry.info_valid) return self.directoryReadFailed();
-                self.loadShortcutEntryMetadata(&entry);
-                candidate.append(allocator, entry) catch return self.directoryReadFailed();
+        var selected: ?Entry = null;
+        const same_location = self.view_mode == job.key.location.mode and equalsIgnoreCase(spanZ(&self.current_path), spanZ(&job.key.location.path));
+        if (same_location and self.snapshotCurrent() and self.selected_index < self.entry_count) selected = self.entries[self.selected_index];
+        if (!details and self.selection_intent_generation == job.key.generation) {
+            for (job.snapshot.values.items) |entry| {
+                if (equalsIgnoreCase(spanZ(&entry.path), spanZ(&self.selection_intent_path))) {
+                    selected = entry;
+                    break;
+                }
             }
-            candidate.sort(PageOrder{ .app = self, .reverse = false }, pageLess);
-            if (watched and self.ctx.sys.directoryChangePoll(&watch) != 0) return self.directoryReadFailed();
-            self.snapshot.deinit(allocator);
-            self.snapshot = candidate;
-            candidate = .{};
-            self.snapshot_watch = watch;
-            self.snapshot_path = self.current_path;
-            self.snapshot_mode = self.sort_mode;
-            self.snapshot_ascending = self.sort_ascending;
-            self.snapshot_valid = watched; // Unobserved snapshots demand-rebuild; exact FREE stays unavailable.
         }
+        self.selection_intent_generation = 0;
+        const previous = self.currentLocation();
+        // Serial native join is the only route to this replacement. A details
+        // job's immutable source span can no longer be in use at this edge.
+        self.snapshot.deinit(self.ctx.sys.allocator());
+        self.snapshot = job.snapshot;
+        job.snapshot = .{};
+        self.view_mode = job.key.location.mode;
+        self.current_path = job.key.location.path;
+        self.sort_mode = job.key.mode;
+        self.sort_ascending = job.key.ascending;
+        self.snapshot_path = self.current_path;
+        self.snapshot_mode = self.sort_mode;
+        self.snapshot_ascending = self.sort_ascending;
+        self.snapshot_watch = job.watch;
+        self.snapshot_valid = self.view_mode == .computer or job.watch.mount_generation != 0;
+        self.computer_inventory_generation = job.inventory_generation;
+        self.display_generation = job.key.generation;
+        self.directory_load_ok = true;
+        self.loaded_location = self.currentLocation();
+        if (!details) {
+            switch (job.key.history) {
+                .none => {},
+                .push => {
+                    self.pushBackHistory(previous);
+                    self.clearForwardHistory();
+                },
+                .back => {
+                    if (self.back_count != 0) self.back_count -= 1;
+                    self.pushForwardHistory(previous);
+                },
+                .forward => {
+                    if (self.forward_count != 0) self.forward_count -= 1;
+                    self.pushBackHistory(previous);
+                },
+            }
+            self.current_drive = job.geometry;
+            if (self.view_mode == .directory) self.free_query.request(job.geometry, job.watch) else self.free_query.clear();
+            self.clearPendingDelete();
+            self.clearPendingPaste();
+            self.name_mode = .none;
+            self.open_with_active = false;
+            self.last_click_index = no_selection;
+            self.last_click_tick = 0;
+        }
+        self.applySnapshotPage(if (details) .refresh else job.key.page, selected, true);
+        self.painted = false;
+        if (!details and job.shortcuts != 0) {
+            // Main keeps this published array immutable and alive until the
+            // serial details job joins. Only copied read-only item bytes cross.
+            self.navigation.armDetails(job, self.snapshot.values.items);
+            _ = self.ctx.desk.guiSetTitle("Explorer - Loading shortcut details...");
+        } else {
+            Navigation.destroy(&self.ctx.sys, job);
+            self.updateLocationTitle();
+        }
+        return true;
+    }
+
+    fn sameEntry(a: Entry, b: Entry) bool {
+        return a.kind == b.kind and a.info_valid and b.info_valid and a.first_cluster == b.first_cluster and a.size == b.size and
+            a.modified_date == b.modified_date and a.modified_time == b.modified_time and equalsIgnoreCase(spanZ(&a.path), spanZ(&b.path));
+    }
+
+    fn readDirectoryPage(self: *App, direction: PageDirection) bool {
+        if (direction != .refresh and self.snapshot_mode == self.sort_mode and self.snapshot_ascending == self.sort_ascending and self.snapshotCurrent()) {
+            if (self.navigation.loading()) {
+                self.navigation.cancel(&self.ctx.sys);
+                self.updateLocationTitle();
+            }
+            const selected: ?Entry = if (self.selected_index < self.entry_count) self.entries[self.selected_index] else null;
+            self.applySnapshotPage(direction, selected, false);
+            return true;
+        }
+        self.queueNavigation(self.currentLocation(), self.sort_mode, self.sort_ascending, .none, direction, true);
+        return true;
+    }
+
+    fn applySnapshotPage(self: *App, direction: PageDirection, selected: ?Entry, preserve_across_pages: bool) void {
         const all = self.snapshot.values.items;
         var start: usize = 0;
-        const anchor: ?Entry = if (direction == .first or self.entry_count == 0 or
-            (direction == .refresh and !self.has_prev_page)) null else self.entries[if (direction == .next) self.entry_count - 1 else 0];
-        if (anchor) |boundary| {
-            var lo: usize = 0;
-            var hi = all.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                const cmp = self.compareEntries(all[mid], boundary);
-                if (cmp < 0 or (direction == .next and cmp == 0)) lo = mid + 1 else hi = mid;
+        var selected_at: ?usize = null;
+        if (selected) |identity| for (all, 0..) |entry, index| {
+            if (sameEntry(identity, entry)) {
+                selected_at = index;
+                break;
             }
-            start = if (direction == .previous) lo -| max_entries else lo;
+        };
+        if (preserve_across_pages and selected_at != null) {
+            start = selected_at.? / max_entries * max_entries;
+        } else {
+            const anchor: ?Entry = if (direction == .first or self.entry_count == 0 or
+                (direction == .refresh and !self.has_prev_page)) null else self.entries[if (direction == .next) self.entry_count - 1 else 0];
+            if (anchor) |boundary| {
+                var lo: usize = 0;
+                var hi = all.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    const order = self.compareEntries(all[mid], boundary);
+                    if (order < 0 or (direction == .next and order == 0)) lo = mid + 1 else hi = mid;
+                }
+                start = if (direction == .previous) lo -| max_entries else lo;
+            }
         }
-        // A concurrent directory shrink may remove the last page entirely.
         if (start == all.len and start != 0) start = (start - 1) / max_entries * max_entries;
         const count = @min(max_entries, all.len - start);
         @memcpy(self.entries[0..count], all[start..][0..count]);
@@ -1413,74 +1585,17 @@ const App = struct {
         self.has_prev_page = start != 0;
         self.has_more_entries = start + count < all.len;
         self.page_start_index = 2 + @as(u32, @intCast(start));
-        self.current_drive = self.loadCurrentDriveInfo();
-        self.loaded_location = self.currentLocation();
         self.scroll_offset = 0;
-        self.clearPendingDelete();
-        self.clearPendingPaste();
-        self.last_click_index = no_selection;
-        self.last_click_tick = 0;
-        self.restoreSelection(spanZ(&selected_path));
+        self.select_all_active = false;
+        self.selected_index = if (selected_at != null and selected_at.? >= start and selected_at.? < start + count) selected_at.? - start else if (count != 0) 0 else no_selection;
         self.ensureSelectionVisible();
-        self.updateDirectoryStatus();
-        return true;
+        if (self.view_mode == .computer) self.updateComputerStatus() else self.updateDirectoryStatus();
     }
 
     fn loadComputerView(self: *App) void {
-        self.free_query.clear();
-        self.entry_count = 0;
-        self.selected_index = no_selection;
-        self.select_all_active = false;
-        self.scroll_offset = 0;
-        self.clearPendingDelete();
-        self.clearPendingPaste();
-        self.has_prev_page = false;
-        self.has_more_entries = false;
-        self.last_click_index = no_selection;
-        self.last_click_tick = 0;
-        self.current_drive = .{};
-        self.view_mode = .computer;
-        setZ(self.current_path[0..], "Computer");
-
-        var index: u8 = 0;
-        while (index < 26 and self.entry_count < self.entries.len) : (index += 1) {
-            const info = self.ctx.sys.driveInfoGeometry(index) orelse continue;
-            if (info.mounted == 0) continue;
-            var entry = Entry{ .kind = entry_kind_drive, .info_valid = true, .attr = 0, .size = info.bytes };
-            entry.modified_time = 0;
-            entry.modified_date = 0;
-            setDriveRoot(entry.path[0..], info.letter);
-            setDriveLabel(entry.label[0..], info.letter);
-            self.entries[self.entry_count] = entry;
-            self.entry_count += 1;
-        }
-        if (self.entry_count > 0) self.selected_index = 0;
-        self.loaded_location = self.currentLocation();
-        self.directory_load_ok = true;
-        self.updateComputerStatus();
-    }
-
-    fn loadEntryInfo(self: *App, entry: *Entry) void {
-        if (self.ctx.sys.fileInfo(zptr(entry.path[0..]))) |info| {
-            entry.info_valid = true;
-            entry.attr = info.attr;
-            entry.size = info.size;
-            entry.first_cluster = info.first_cluster;
-            entry.modified_time = info.modified_time;
-            entry.modified_date = info.modified_date;
-            if (info.is_dir != 0) entry.kind = entry_kind_dir;
-        }
-    }
-
-    fn loadShortcutEntryMetadata(self: *const App, entry: *Entry) void {
-        if (entry.kind != entry_kind_file or !isShortcutPath(spanZ(entry.path[0..]))) return;
-        entry.is_shortcut = true;
-        shortcutLabelFromPath(entry.label[0..], spanZ(entry.path[0..]));
-        const link = self.readShortcutFile(spanZ(entry.path[0..])) catch return;
-        const resolved = link.resolve() catch return;
-        entry.shortcut_valid = true;
-        if (resolved.title.len != 0) copyZ(entry.label[0..], resolved.title);
-        if (resolved.icon.len != 0) copyZ(entry.shortcut_icon[0..], resolved.icon);
+        var location: HistoryEntry = .{};
+        setZ(&location.path, "Computer");
+        self.queueNavigation(location, self.sort_mode, self.sort_ascending, .none, .first, true);
     }
 
     fn timestampView(self: *const App) TimestampView {
@@ -1495,24 +1610,8 @@ const App = struct {
         return .{};
     }
 
-    fn loadCurrentDriveInfo(self: *App) r4os.abi.DriveInfo {
-        // A frame for the previous navigation generation cannot admit work for
-        // this one. Only a successful render can reopen the publication gate.
-        self.painted = false;
-        const letter = driveRootLetter(spanZ(self.current_path[0..]));
-        if (letter < 'A' or letter > 'Z') {
-            self.free_query.clear();
-            return .{};
-        }
-        const info = self.ctx.sys.driveInfoGeometry(letter - 'A') orelse {
-            self.free_query.clear();
-            return .{ .letter = letter };
-        };
-        self.free_query.request(info, if (self.snapshot_valid) self.snapshot_watch else .{});
-        return info;
-    }
-
     fn openSelected(self: *App) void {
+        if (!self.guardCurrentEntries()) return;
         self.clearPendingDelete();
         self.clearPendingPaste();
         if (self.select_all_active) {
@@ -1535,6 +1634,7 @@ const App = struct {
     }
 
     fn beginOpenWith(self: *App) void {
+        if (!self.guardCurrentEntries()) return;
         self.clearPendingDelete();
         self.clearPendingPaste();
         if (self.select_all_active) {
@@ -1725,6 +1825,7 @@ const App = struct {
     }
 
     fn commitOpenWith(self: *App) void {
+        if (!self.guardCurrentEntries()) return;
         const choice = self.openWithChoice(self.open_with_index) orelse {
             self.closeOpenWith("Open With selection invalid");
             return;
@@ -1813,13 +1914,9 @@ const App = struct {
             self.render();
             return;
         }
-        const old = self.currentLocation();
-        parentPath(self.current_path[0..]);
-        self.loadFirstDirectoryPage();
-        if (self.directory_load_ok) {
-            self.pushBackHistory(old);
-            self.clearForwardHistory();
-        }
+        var parent = self.current_path;
+        parentPath(&parent);
+        self.navigateToPath(spanZ(&parent), true);
         self.render();
     }
 
@@ -1859,10 +1956,6 @@ const App = struct {
         self.render();
     }
 
-    fn loadFirstDirectoryPage(self: *App) void {
-        self.directory_load_ok = self.readDirectoryPage(.first);
-    }
-
     fn nextPage(self: *App) void {
         if (!self.has_more_entries) {
             setZ(self.status[0..], "Already at last page");
@@ -1878,62 +1971,28 @@ const App = struct {
     }
 
     fn sortBy(self: *App, mode: SortMode) void {
-        const old_mode = self.sort_mode;
-        const old_ascending = self.sort_ascending;
-        if (self.sort_mode == mode) {
-            self.sort_ascending = !self.sort_ascending;
-        } else {
-            self.sort_mode = mode;
-            self.sort_ascending = true;
-        }
-        self.directory_load_ok = self.readDirectoryPage(.first);
-        if (!self.directory_load_ok) {
-            self.sort_mode = old_mode;
-            self.sort_ascending = old_ascending;
-        }
+        const wanted = self.navigation.desired;
+        const previous_mode = if (self.navigation.busy() and wanted != null) wanted.?.mode else self.sort_mode;
+        const previous_ascending = if (self.navigation.busy() and wanted != null) wanted.?.ascending else self.sort_ascending;
+        const ascending = if (previous_mode == mode) !previous_ascending else true;
+        self.queueNavigation(self.currentLocation(), mode, ascending, .none, .first, true);
         self.render();
     }
 
-    fn sortEntries(self: *App) void {
-        var i: usize = 0;
-        while (i < self.entry_count) : (i += 1) {
-            var best = i;
-            var j = i + 1;
-            while (j < self.entry_count) : (j += 1) {
-                if (self.compareEntries(self.entries[j], self.entries[best]) < 0) best = j;
-            }
-            if (best != i) {
-                const tmp = self.entries[i];
-                self.entries[i] = self.entries[best];
-                self.entries[best] = tmp;
-            }
-        }
-    }
-
     fn compareEntries(self: *const App, a: Entry, b: Entry) i8 {
-        const dir_cmp = compareBoolDesc(a.kind > 0, b.kind > 0);
-        if (dir_cmp != 0) return dir_cmp;
-        var cmp = self.compareByMode(self.sort_mode, a, b);
-        if (cmp == 0) cmp = compareNames(a, b);
-        if (cmp == 0) cmp = switch (std.mem.order(u8, spanZ(&a.path), spanZ(&b.path))) {
-            .lt => -1,
-            .eq => 0,
-            .gt => 1,
-        };
-        if (!self.sort_ascending) cmp = -cmp;
-        return cmp;
-    }
-
-    fn compareByMode(self: *const App, mode: SortMode, a: Entry, b: Entry) i8 {
-        return switch (mode) {
-            .name => compareNames(a, b),
-            .kind => compareU8(self.entryTypeRank(a), self.entryTypeRank(b)),
-            .size => compareU64(if (a.kind > 0) 0 else a.size, if (b.kind > 0) 0 else b.size),
-            .modified => compareU32(dateSortValue(a), dateSortValue(b)),
-        };
+        return compareConfigured(self.sort_mode, self.sort_ascending, &self.assoc, a, b);
     }
 
     fn restoreSelection(self: *App, selected_path: []const u8) void {
+        // Rename/create/paste may request selection after queuing a refresh.
+        // Bind that intent to this exact request; later navigation clears it.
+        if (self.navigation.loading()) {
+            if (self.navigation.desired) |wanted| {
+                self.selection_intent_generation = wanted.generation;
+                copyZ(&self.selection_intent_path, selected_path);
+                return;
+            }
+        }
         self.select_all_active = false;
         if (selected_path.len == 0) {
             self.selected_index = if (self.entry_count > 0) 0 else no_selection;
@@ -1968,88 +2027,44 @@ const App = struct {
     }
 
     fn navigateToComputer(self: *App, record_history: bool) void {
-        const old = self.currentLocation();
-        if (record_history) {
-            self.pushBackHistory(old);
-            self.clearForwardHistory();
-        }
-        self.view_mode = .computer;
-        self.loadComputerView();
+        var location: HistoryEntry = .{};
+        setZ(&location.path, "Computer");
+        self.queueNavigation(location, self.sort_mode, self.sort_ascending, if (record_history) .push else .none, .first, true);
     }
-
     fn navigateToPath(self: *App, path: []const u8, record_history: bool) void {
         if (path.len == 0) return;
-        var target: [128]u8 = .{0} ** 128;
-        if (!r4os.bounded_text.assignZ(&target, path)) {
+        var location = HistoryEntry{ .mode = .directory };
+        if (!r4os.bounded_text.assignZ(&location.path, path)) {
             setZ(&self.status, "Path invalid or too long; previous location retained");
             return;
         }
-        const letter = driveRootLetter(spanZ(target[0..]));
+        const letter = driveRootLetter(path);
         if (letter < 'A' or letter > 'Z') {
-            setZ(self.status[0..], "Path is not a drive path");
+            setZ(&self.status, "Path is not a drive path");
             return;
         }
-        const info = self.ctx.sys.driveInfoGeometry(letter - 'A') orelse {
-            setZ(self.status[0..], "Drive not mounted");
-            return;
-        };
-        if (!driveBrowsable(info.kind)) {
-            setZ(self.status[0..], "Drive is not a browsable volume");
-            return;
-        }
-        const old = self.currentLocation();
-        self.view_mode = .directory;
-        copyZ(self.current_path[0..], spanZ(target[0..]));
-        self.loadFirstDirectoryPage();
-        if (self.directory_load_ok and record_history) {
-            self.pushBackHistory(old);
-            self.clearForwardHistory();
-        }
+        self.queueNavigation(location, self.sort_mode, self.sort_ascending, if (record_history) .push else .none, .first, true);
     }
-
-    fn restoreLocation(self: *App, entry: HistoryEntry) void {
-        self.view_mode = entry.mode;
-        copyZ(self.current_path[0..], spanZ(entry.path[0..]));
-        if (entry.mode == .computer) {
-            self.loadComputerView();
-        } else {
-            self.loadFirstDirectoryPage();
-        }
-    }
-
     fn goBack(self: *App) void {
         self.clearPendingDelete();
         self.clearPendingPaste();
         if (self.back_count == 0) {
-            setZ(self.status[0..], "No previous location");
+            setZ(&self.status, "No previous location");
             self.render();
             return;
         }
-        const current = self.currentLocation();
-        const previous = self.back_history[self.back_count - 1];
-        self.restoreLocation(previous);
-        if (self.directory_load_ok) {
-            self.back_count -= 1;
-            self.pushForwardHistory(current);
-        }
+        self.queueNavigation(self.back_history[self.back_count - 1], self.sort_mode, self.sort_ascending, .back, .first, true);
         self.render();
     }
-
     fn goForward(self: *App) void {
         self.clearPendingDelete();
         self.clearPendingPaste();
         if (self.forward_count == 0) {
-            setZ(self.status[0..], "No next location");
+            setZ(&self.status, "No next location");
             self.render();
             return;
         }
-        const current = self.currentLocation();
-        const next = self.forward_history[self.forward_count - 1];
-        self.restoreLocation(next);
-        if (self.directory_load_ok) {
-            self.forward_count -= 1;
-            self.pushBackHistory(current);
-        }
+        self.queueNavigation(self.forward_history[self.forward_count - 1], self.sort_mode, self.sort_ascending, .forward, .first, true);
         self.render();
     }
 
@@ -2057,42 +2072,19 @@ const App = struct {
         self.clearPendingDelete();
         self.clearPendingPaste();
         const upper = asciiUpper(letter);
-        const index: u32 = if (upper >= 'A' and upper <= 'Z') upper - 'A' else 0;
-        const info = self.ctx.sys.driveInfoGeometry(index) orelse {
-            setZ(self.status[0..], "Drive not mounted");
-            self.render();
-            return;
-        };
-        if (!driveBrowsable(info.kind)) {
-            setZ(self.status[0..], "Drive is not a browsable volume");
-            self.render();
-            return;
-        }
-        var path: [4]u8 = .{0} ** 4;
-        setDriveRoot(path[0..], upper);
-        self.navigateToPath(spanZ(path[0..]), true);
+        if (upper < 'A' or upper > 'Z') return;
+        var path: [4]u8 = @splat(0);
+        setDriveRoot(&path, upper);
+        self.navigateToPath(spanZ(&path), true);
         self.render();
     }
 
     fn switchToNextBrowseDrive(self: *App) void {
-        self.clearPendingDelete();
-        self.clearPendingPaste();
-        const current = driveRootLetter(spanZ(self.current_path[0..]));
-        const current_index: u8 = if (current >= 'A' and current <= 'Z') current - 'A' else 0;
-        var step: u8 = 1;
-        while (step < 26) : (step += 1) {
-            const index: u8 = @intCast((@as(u16, current_index) + step) % 26);
-            if (self.ctx.sys.driveInfoGeometry(index)) |info| {
-                if (driveBrowsable(info.kind)) {
-                    var path: [4]u8 = .{0} ** 4;
-                    setDriveRoot(path[0..], info.letter);
-                    self.navigateToPath(spanZ(path[0..]), true);
-                    self.render();
-                    return;
-                }
-            }
-        }
-        setZ(self.status[0..], "No FAT32 drive available");
+        var location = HistoryEntry{ .mode = .directory };
+        const current = driveRootLetter(spanZ(&self.current_path));
+        setDriveRoot(&location.path, if (current >= 'A' and current <= 'Z') current else 'C');
+        self.queueNavigation(location, self.sort_mode, self.sort_ascending, .push, .first, true);
+        if (self.navigation.desired) |*wanted| wanted.cycle_drive = true;
         self.render();
     }
 
@@ -2198,6 +2190,7 @@ const App = struct {
     }
 
     fn deleteSelected(self: *App) void {
+        if (!self.guardCurrentEntries()) return;
         if (self.view_mode == .computer) {
             setZ(self.status[0..], "Drives cannot be deleted here");
             self.render();
@@ -2234,6 +2227,7 @@ const App = struct {
     }
 
     fn deleteAllSelected(self: *App) void {
+        if (!self.guardCurrentEntries()) return;
         if (!self.pending_delete or !self.pending_delete_all) {
             self.clearPendingDelete();
             self.pending_delete = true;
@@ -2300,6 +2294,7 @@ const App = struct {
     }
 
     fn beginRename(self: *App) void {
+        if (!self.guardCurrentEntries()) return;
         self.clearPendingDelete();
         self.clearPendingPaste();
         if (self.select_all_active) {
@@ -2431,6 +2426,7 @@ const App = struct {
     }
 
     fn commitNameDialog(self: *App) void {
+        if (!self.guardCurrentEntries()) return;
         const name = self.name_input.value();
         if (!self.name_input_valid or !validFileName(name)) {
             setZ(self.status[0..], "Invalid name");
@@ -2977,7 +2973,7 @@ const App = struct {
     fn entryTypeName(self: *const App, entry: *const Entry) []const u8 {
         if (entry.kind == entry_kind_drive) return "Drive";
         if (entry.kind > 0) return "Folder";
-        if (entry.is_shortcut) return if (entry.shortcut_valid) "Shortcut" else "Invalid shortcut";
+        if (entry.is_shortcut) return if (!entry.shortcut_known or entry.shortcut_valid) "Shortcut" else "Invalid shortcut";
         const path = spanZ(entry.path[0..]);
         if (endsWithIgnoreCase(path, ".R4X")) return "R4X program";
         if (endsWithIgnoreCase(path, ".R4D")) return "R4D driver";
@@ -2987,21 +2983,11 @@ const App = struct {
     fn entryTypeShort(self: *const App, entry: *const Entry) []const u8 {
         if (entry.kind == entry_kind_drive) return "Drive";
         if (entry.kind > 0) return "Folder";
-        if (entry.is_shortcut) return if (entry.shortcut_valid) "Shortcut" else "Bad link";
+        if (entry.is_shortcut) return if (!entry.shortcut_known or entry.shortcut_valid) "Shortcut" else "Bad link";
         const path = spanZ(entry.path[0..]);
         if (endsWithIgnoreCase(path, ".R4X")) return "R4X";
         if (endsWithIgnoreCase(path, ".R4D")) return "Driver";
         return file_assoc.typeShort(&self.assoc, path);
-    }
-
-    fn entryTypeRank(self: *const App, entry: Entry) u8 {
-        if (entry.kind == entry_kind_drive) return 0;
-        if (entry.kind > 0) return 1;
-        if (entry.is_shortcut) return 2;
-        const path = spanZ(entry.path[0..]);
-        if (endsWithIgnoreCase(path, ".R4X")) return 3;
-        if (endsWithIgnoreCase(path, ".R4D")) return 4;
-        return file_assoc.rank(&self.assoc, path);
     }
 };
 
@@ -3663,6 +3649,33 @@ fn sortModeName(mode: SortMode) []const u8 {
     };
 }
 
+fn compareConfigured(mode: SortMode, ascending: bool, config: *const r4std.app_assoc.Config, a: Entry, b: Entry) i8 {
+    const directory = compareBoolDesc(a.kind > 0, b.kind > 0);
+    if (directory != 0) return directory;
+    var order = switch (mode) {
+        .name => compareNames(a, b),
+        .kind => compareU8(typeRankConfigured(config, a), typeRankConfigured(config, b)),
+        .size => compareU64(if (a.kind > 0) 0 else a.size, if (b.kind > 0) 0 else b.size),
+        .modified => compareU32(dateSortValue(a), dateSortValue(b)),
+    };
+    if (order == 0) order = compareNames(a, b);
+    if (order == 0) order = switch (std.mem.order(u8, spanZ(&a.path), spanZ(&b.path))) {
+        .lt => -1,
+        .eq => 0,
+        .gt => 1,
+    };
+    return if (ascending) order else -order;
+}
+fn typeRankConfigured(config: *const r4std.app_assoc.Config, entry: Entry) u8 {
+    if (entry.kind == entry_kind_drive) return 0;
+    if (entry.kind > 0) return 1;
+    if (entry.is_shortcut) return 2;
+    const path = spanZ(&entry.path);
+    if (endsWithIgnoreCase(path, ".R4X")) return 3;
+    if (endsWithIgnoreCase(path, ".R4D")) return 4;
+    return file_assoc.rank(config, path);
+}
+
 fn compareNames(a: Entry, b: Entry) i8 {
     return compareTextIgnoreCase(spanZ(a.label[0..]), spanZ(b.label[0..]));
 }
@@ -4286,4 +4299,41 @@ test "EXPLORER dialog owner keeps full Unicode source and atomic bounded paste" 
     defer std.testing.allocator.destroy(app);
     app.* = .{ .ctx = undefined };
     try checkDialogText(app);
+}
+
+// Exercise the actual published page owner: metadata can reorder a selected
+// item across pages; replacing its on-disk identity must not retain selection.
+test "navigation view owner preserves identity across resort and page boundaries" {
+    const app = try std.testing.allocator.create(App);
+    defer std.testing.allocator.destroy(app);
+    app.* = .{ .ctx = undefined, .view_mode = .directory, .assoc = r4std.app_assoc.Config.initDefault() };
+    defer app.snapshot.deinit(std.testing.allocator);
+    for (0..70) |index| {
+        var item = Entry{ .info_valid = true, .first_cluster = @intCast(index + 1), .size = 7 };
+        _ = try std.fmt.bufPrintZ(&item.path, "C:\\DIR\\ITEM{d:0>2}", .{index});
+        _ = try std.fmt.bufPrintZ(&item.label, "Item{d:0>2}", .{index});
+        try app.snapshot.append(std.testing.allocator, item);
+    }
+    app.applySnapshotPage(.first, null, false);
+    try std.testing.expect(app.entry_count == 64 and !app.has_prev_page and app.has_more_entries);
+    app.applySnapshotPage(.next, app.entries[0], false);
+    try std.testing.expect(app.entry_count == 6 and app.has_prev_page and !app.has_more_entries);
+    try std.testing.expectEqualStrings("C:\\DIR\\ITEM64", spanZ(&app.entries[0].path));
+    app.applySnapshotPage(.previous, app.entries[0], false);
+    try std.testing.expect(app.entry_count == 64 and !app.has_prev_page and app.has_more_entries);
+    const selected = app.snapshot.values.items[5];
+    setZ(&app.snapshot.values.items[5].label, "ZZZ metadata title");
+    const Compare = struct {
+        fn less(ctx: *App, left: Entry, right: Entry) bool {
+            return ctx.compareEntries(left, right) < 0;
+        }
+    };
+    std.sort.heap(Entry, app.snapshot.values.items, app, Compare.less);
+    app.applySnapshotPage(.refresh, selected, true);
+    try std.testing.expect(app.has_prev_page and app.selected_index == 5);
+    try std.testing.expectEqualStrings(spanZ(&selected.path), spanZ(&app.entries[app.selected_index].path));
+    try std.testing.expectEqualStrings("ZZZ metadata title", spanZ(&app.entries[app.selected_index].label));
+    app.snapshot.values.items[69].first_cluster += 1;
+    app.applySnapshotPage(.refresh, selected, true);
+    try std.testing.expect(!equalsIgnoreCase(spanZ(&selected.path), spanZ(&app.entries[app.selected_index].path)));
 }
