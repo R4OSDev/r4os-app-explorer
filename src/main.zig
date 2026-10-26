@@ -2,6 +2,7 @@ const r4os = @import("r4os");
 const r4std = @import("r4std");
 const std = @import("std");
 pub const drive_free = @import("drive_free.zig");
+pub const shortcut_icons = @import("shortcut_icons.zig");
 const AppApi = struct {
     sys: r4os.r4sys.Context,
     desk: r4os.r4desk.Context,
@@ -262,7 +263,8 @@ const NavigationModel = struct {
         const resolved = link.resolve() catch return;
         entry.shortcut_valid = true;
         if (resolved.title.len != 0) copyZ(&entry.label, resolved.title);
-        if (resolved.icon.len != 0) copyZ(&entry.shortcut_icon, resolved.icon);
+        // File identity must never alias a clipped path. Oversize uses default.
+        if (resolved.icon.len != 0 and resolved.icon.len < entry.shortcut_icon.len) copyZ(&entry.shortcut_icon, resolved.icon);
     }
     pub fn compare(mode: ThisFileSortMode, ascending: bool, config: *const Config, a: Entry, b: Entry) i8 {
         return compareConfigured(mode, ascending, config, a, b);
@@ -272,17 +274,9 @@ const ThisFileSortMode = SortMode;
 const ThisFilePageDirection = PageDirection;
 pub const Navigation = @import("navigation.zig").Owner(NavigationModel);
 
-const DecodedIcon = struct {
-    width: u32,
-    height: u32,
-};
-
-const LoadedIconImage = struct {
-    loaded: bool = false,
-    width: u32 = 0,
-    height: u32 = 0,
-    pixels: [loaded_icon_pixels_max]u32 = .{0} ** loaded_icon_pixels_max,
-};
+const DecodedIcon = shortcut_icons.Size;
+const LoadedIconImage = shortcut_icons.Image;
+pub const ShortcutIcons = shortcut_icons.Owner(decodeShortcutIconBytes);
 
 pub fn r4_app_main(r4_app: *r4os.App) i32 {
     if (!r4std.init(r4_app.startContext())) return r4os.abi.err_no_group;
@@ -301,6 +295,7 @@ const App = struct {
     ctx: *AppApi,
     free_query: drive_free.Owner = .{},
     navigation: Navigation = .{},
+    shortcut_assets: ShortcutIcons = .{},
     navigation_retries: u8 = 0,
     display_generation: u64 = 0,
     selection_intent_generation: u64 = 0,
@@ -382,6 +377,7 @@ const App = struct {
     fn runHosted(self: *App) i32 {
         defer self.snapshot.deinit(self.ctx.sys.allocator());
         defer self.navigation.drain(&self.ctx.sys);
+        defer self.shortcut_assets.drain(&self.ctx.sys);
         defer self.free_query.drain(&self.ctx.sys);
         _ = self.ctx.desk.guiSetTitle("Explorer");
         self.setExplorerMinFrameSize();
@@ -396,6 +392,7 @@ const App = struct {
         // are not used here. File/directory cursors remain demand-checked.
         events.subscriptions = 0;
         while (!self.quit_requested and !self.ctx.sys.programShouldClose()) {
+            if (self.shortcut_assets.poll(&self.ctx.sys)) self.render();
             if (self.pollNavigation()) self.render();
             const navigation_was_active = if (self.navigation.job) |job| job.active else false;
             if (self.painted and self.navigation.afterPublish(&self.ctx.sys, &self.assoc)) {
@@ -423,7 +420,8 @@ const App = struct {
                 if (self.view_mode == .directory and std.mem.eql(u8, spanZ(&self.status), spanZ(&self.directory_status))) self.updateDirectoryStatus();
                 self.render();
             }
-            const wait = if (self.free_query.busy() or self.navigation.busy())
+            if (self.painted) self.shortcut_assets.afterPublish(&self.ctx.sys);
+            const wait = if (self.free_query.busy() or self.navigation.busy() or self.shortcut_assets.busy())
                 r4os.time_contract.timeoutFinite(.{ .nanoseconds = 1_000_000 })
             else
                 r4os.time_contract.timeoutForever();
@@ -737,7 +735,22 @@ const App = struct {
         self.render();
     }
 
+    fn prepareShortcutAssets(self: *App) bool {
+        var paths: [max_entries][128]u8 = undefined;
+        var count: usize = 0;
+        const end = @min(self.entry_count, self.scroll_offset + self.visibleIconCount());
+        for (self.entries[@min(self.scroll_offset, self.entry_count)..end]) |*entry| {
+            if (entry.is_shortcut and entry.shortcut_valid and entry.shortcut_icon[0] != 0) {
+                paths[count] = entry.shortcut_icon;
+                count += 1;
+            }
+        }
+        self.shortcut_assets.setWanted(paths[0..count], self.display_generation);
+        return self.shortcut_assets.refresh(&self.ctx.sys);
+    }
+
     fn render(self: *App) void {
+        _ = self.prepareShortcutAssets();
         self.painted = false;
         var paint = switch (r4os.app_gui.beginPaintForSize(&self.ctx.draw, self.hosted_w, self.hosted_h)) {
             .paint => |value| value,
@@ -781,6 +794,10 @@ const App = struct {
     }
 
     fn renderSelection(self: *App, old: usize, old_all: bool, old_scroll: usize) void {
+        if (self.prepareShortcutAssets()) {
+            self.render();
+            return;
+        }
         // Only selection pixels and the status text change. Scroll/resize,
         // overlays, Select All and content changes publish a complete frame.
         // Periodic full frames bound the retained immutable delta chain.
@@ -1082,17 +1099,8 @@ const App = struct {
     }
 
     fn drawShortcutIconPath(self: *App, canvas: r4os.gui.Canvas, rect: r4os.gui.Rect, path: []const u8) bool {
-        var bytes: [toolbar_icon_bytes_max]u8 = undefined;
-        var pixels: [loaded_icon_pixels_max]u32 = undefined;
-        const icon = decodeFolderIcon(&self.ctx.sys, path, bytes[0..], pixels[0..]) orelse return false;
-        const icon_w: i32 = @intCast(icon.width);
-        const icon_h: i32 = @intCast(icon.height);
-        const icon_x = rect.x + @divTrunc(rect.w - icon_w, 2);
-        const icon_y = rect.y + @divTrunc(rect.h - icon_h, 2);
-        const pixel_count = @as(usize, @intCast(icon.width)) * @as(usize, @intCast(icon.height));
-        if (pixel_count > pixels.len) return false;
-        _ = canvas.raster(icon_x, icon_y, icon.width, icon.height, 1, pixels[0..pixel_count]);
-        return true;
+        const image = self.shortcut_assets.image(path) orelse return false;
+        return self.drawLoadedIconCentered(canvas, rect, image);
     }
 
     fn drawShortcutOverlay(self: *App, canvas: r4os.gui.Canvas, rect: r4os.gui.Rect) void {
@@ -1174,212 +1182,6 @@ const App = struct {
             .{ .title = size, .width = table_size_w, .alignment = .right },
             .{ .title = modified, .width = table_date_w, .alignment = .left },
         };
-    }
-
-    fn drawDetails(self: *App, canvas: r4os.gui.Canvas, scratch: []u8) void {
-        const rect = self.detailsRect();
-        _ = canvas.rect(.{ .x = rect.x, .y = rect.y, .w = rect.w, .h = 18 }, title_bg);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 6, .y = rect.y + 4, .w = rect.w - 12, .h = 12 },
-            .text = "Details",
-            .fg = white,
-            .bg = title_bg,
-        }, scratch);
-        if (self.selected_index >= self.entry_count) {
-            self.drawDriveDetails(canvas, scratch, rect);
-            return;
-        }
-        const entry = &self.entries[self.selected_index];
-        self.drawEntryDetails(canvas, scratch, rect, entry);
-    }
-
-    fn writeEntryName(self: *const App, out: []u8, entry: *const Entry) void {
-        copyZ(out, "");
-        const prefix_text = self.entryPrefix(entry);
-        if (prefix_text.len != 0) {
-            appendZ(out, prefix_text);
-            appendZ(out, " ");
-        }
-        appendZ(out, spanZ(entry.label[0..]));
-    }
-
-    fn drawDriveDetails(self: *App, canvas: r4os.gui.Canvas, scratch: []u8, rect: r4os.gui.Rect) void {
-        var line: [96]u8 = .{0} ** 96;
-        copyZ(line[0..], "Drive: ");
-        if (self.current_drive.mounted != 0) {
-            appendZ(line[0..], driveLetterText(self.current_drive.letter));
-            appendZ(line[0..], " ");
-            appendZ(line[0..], spanZ(self.current_drive.name[0..]));
-        } else {
-            appendZ(line[0..], driveLetterText(driveRootLetter(spanZ(self.current_path[0..]))));
-            appendZ(line[0..], ": not mounted");
-        }
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 30, .w = rect.w - 16, .h = 14 },
-            .text = spanZ(line[0..]),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 50, .w = rect.w - 16, .h = 14 },
-            .text = driveRoleLine(line[0..], self.current_drive),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 70, .w = rect.w - 16, .h = 14 },
-            .text = driveSizeLine(line[0..], "Size: ", self.current_drive.bytes),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 90, .w = rect.w - 16, .h = 14 },
-            .text = switch (self.free_query.state) {
-                .ready => driveSizeLine(line[0..], "Free: ", self.current_drive.free_bytes),
-                .pending => "Free: calculating...",
-                .unknown => "Free: unknown",
-                .unavailable => "Free: unavailable",
-            },
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 110, .w = rect.w - 16, .h = 14 },
-            .text = driveClusterLine(line[0..], self.current_drive),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 134, .w = rect.w - 16, .h = 14 },
-            .text = "Path:",
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 154, .w = rect.w - 16, .h = 48 },
-            .text = spanZ(self.current_path[0..]),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-    }
-
-    fn drawEntryDetails(self: *App, canvas: r4os.gui.Canvas, scratch: []u8, rect: r4os.gui.Rect, entry: *const Entry) void {
-        const timestamp_view = self.timestampView();
-        var line: [96]u8 = .{0} ** 96;
-        copyZ(line[0..], "Type: ");
-        appendZ(line[0..], self.entryTypeName(entry));
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 30, .w = rect.w - 16, .h = 14 },
-            .text = spanZ(line[0..]),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        copyZ(line[0..], "Name: ");
-        appendZ(line[0..], spanZ(entry.label[0..]));
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 50, .w = rect.w - 16, .h = 14 },
-            .text = spanZ(line[0..]),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        if (entry.is_shortcut) {
-            self.drawShortcutDetails(canvas, scratch, rect, entry, line[0..]);
-            return;
-        }
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 70, .w = rect.w - 16, .h = 14 },
-            .text = sizeLine(line[0..], entry),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 90, .w = rect.w - 16, .h = 14 },
-            .text = attrLine(line[0..], entry),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 110, .w = rect.w - 16, .h = 14 },
-            .text = modifiedLine(line[0..], entry, timestamp_view),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 134, .w = rect.w - 16, .h = 14 },
-            .text = "Path:",
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 154, .w = rect.w - 16, .h = 48 },
-            .text = spanZ(entry.path[0..]),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-    }
-
-    fn drawShortcutDetails(self: *App, canvas: r4os.gui.Canvas, scratch: []u8, rect: r4os.gui.Rect, entry: *const Entry, line: []u8) void {
-        var target_line: [128]u8 = .{0} ** 128;
-        var args_line: [128]u8 = .{0} ** 128;
-        var policy_line: [40]u8 = .{0} ** 40;
-        const link = self.readShortcutFile(spanZ(entry.path[0..])) catch |err| {
-            copyZ(target_line[0..], "Target: ");
-            appendZ(target_line[0..], shortcutErrorText(err));
-            copyZ(args_line[0..], "Args: -");
-            copyZ(policy_line[0..], "Policy: -");
-            self.drawShortcutDetailLines(canvas, scratch, rect, spanZ(target_line[0..]), spanZ(args_line[0..]), spanZ(policy_line[0..]), entry, line);
-            return;
-        };
-        const resolved = link.resolve() catch |err| {
-            copyZ(target_line[0..], "Target: ");
-            appendZ(target_line[0..], shortcutErrorText(err));
-            copyZ(args_line[0..], "Args: -");
-            copyZ(policy_line[0..], "Policy: -");
-            self.drawShortcutDetailLines(canvas, scratch, rect, spanZ(target_line[0..]), spanZ(args_line[0..]), spanZ(policy_line[0..]), entry, line);
-            return;
-        };
-        copyZ(target_line[0..], "Target: ");
-        appendZ(target_line[0..], resolved.target);
-        copyZ(args_line[0..], "Args: ");
-        appendZ(args_line[0..], if (resolved.args.len == 0) "-" else resolved.args);
-        copyZ(policy_line[0..], "Policy: ");
-        appendZ(policy_line[0..], r4std.shortcut.policyText(resolved.policy));
-        self.drawShortcutDetailLines(canvas, scratch, rect, spanZ(target_line[0..]), spanZ(args_line[0..]), spanZ(policy_line[0..]), entry, line);
-    }
-
-    fn drawShortcutDetailLines(self: *App, canvas: r4os.gui.Canvas, scratch: []u8, rect: r4os.gui.Rect, target: []const u8, args: []const u8, policy: []const u8, entry: *const Entry, line: []u8) void {
-        _ = self;
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 70, .w = rect.w - 16, .h = 32 },
-            .text = target,
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 106, .w = rect.w - 16, .h = 14 },
-            .text = args,
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 126, .w = rect.w - 16, .h = 14 },
-            .text = policy,
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 150, .w = rect.w - 16, .h = 14 },
-            .text = "Path:",
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = canvas.label(.{
-            .rect = .{ .x = rect.x + 8, .y = rect.y + 170, .w = rect.w - 16, .h = 32 },
-            .text = spanZ(entry.path[0..]),
-            .fg = black,
-            .bg = panel_bg,
-        }, scratch);
-        _ = line;
     }
 
     fn loadDirectory(self: *App) void {
@@ -3533,6 +3335,10 @@ fn readOwnFileResource(ctx: *const r4os.r4sys.Context, resource_name: []const u8
     const read = ctx.moduleResourceRead(zptr(module_path[0..]), r4os.r4sys.module_resource_type_file, 0, zptr(name_buf[0..]), bytes_buffer);
     if (read <= 0) return null;
     return bytes_buffer[0..@as(usize, @intCast(read))];
+}
+
+fn decodeShortcutIconBytes(bytes: []const u8, pixels: []u32) ?DecodedIcon {
+    return decodeIconBytes(bytes, pixels, folder_icon_max_w, folder_icon_max_h, folder_icon_preferred, white);
 }
 
 fn decodeFolderIcon(ctx: *const r4os.r4sys.Context, path_text: []const u8, bytes_buffer: []u8, pixels: []u32) ?DecodedIcon {

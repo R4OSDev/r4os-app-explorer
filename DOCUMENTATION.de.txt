@@ -89,3 +89,24 @@ Linux: ./Build.sh; gezielt ./Build.sh navigation-test drive-free-test
 dialog-text-test. Windows verwendet dieselben Ziele ueber Build.bat.
 Native und fachliche Belege: Docs/Desktop/README.txt.44 und
 Docs/Diagnostics/Spectra.txt.44. Kein physischer Latenz-/OssiPC-Nachweis.
+
+Shortcut-Icons seit0.87.45
+--------------------------
+Ein64-Slot-LRU gehoert ausschliesslich dem Main-Thread. Sichtbare Shortcut-
+Pfade werden geprueft und kopiert, dann ausserhalb des Zeichnens in einem
+eigenen BSP-Job gelesen/dekodiert. Max32x32 Pixel und4096 ganze Dateibytes;
+groessere/ungueltige/fehlende Icons erhalten das Standardicon, bekannte
+Fehlresultate werden mitgehalten. Unbekannte/unmontierte Laufwerke und
+fehlgeschlagene Zulassung warten einen ausdruecklichen Ansichtsrefresh ab.
+Keine Pfadabkuerzung darf auf eine andere Datei zeigen. Vor Uebernahme/
+Zeichnen werden exakter Mounttoken und globale Dateisystempublikation in
+RAM geprueft, je unterschiedlichem gehaltenen Mount. Keine Storage-Inventar-
+abfrage im Cache: deren Kaltpfad kann Partitionen lesen. Echte Nativejoins
+gehen Kopie/Freigabe voraus; GUI-Ressourcen besitzen eigene Pixelkopien.
+Der fruehere Detailrenderer hatte keine aktuellen Aufrufer und wurde mit
+seiner5-Funktionskette entfernt. Die44-Metadaten werden weiterverwendet;
+das ausdrueckliche Oeffnen liest den Shortcut weiterhin frisch.
+Build.sh shortcut-icons-test (Windows Build.bat), originale Besitzerziele,
+EXPTEXT /SELFTEST /FILES und SPECTRA CHECK DESKTOP /HOST /NAV /ICONS.
+Fachbelege/Gueltigkeitsgrenzen: Docs/Desktop/README.txt.45 und
+Docs/Diagnostics/Spectra.txt.45. Kein physischer Latenz-/OssiPC-Nachweis.

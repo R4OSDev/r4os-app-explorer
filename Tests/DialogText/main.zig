@@ -18,7 +18,8 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     if (sys.threadCurrentHandle(&identity) != r4os.abi.thread_ok) return 1;
     const geometry = sys.driveInfoGeometry('C' - 'A') orelse return 1;
     if (!freeOwnerNativeSelfTest(&sys, geometry, identity)) return 1;
-    return if (navigationNativeSelfTest(&sys, identity)) 0 else 1;
+    if (!navigationNativeSelfTest(&sys, identity)) return 1;
+    return if (iconsNativeSelfTest(&sys, identity)) 0 else 1;
 }
 
 fn waitFreeJoined(ctx: *const r4os.r4sys.Context, owner: *drive_free.Owner) ?drive_free.Joined {
@@ -188,4 +189,152 @@ fn navigationNativeSelfTest(sys: *const r4os.r4sys.Context, identity: r4os.abi.P
     if (owner.busy()) return false;
     sys.println("EXPLORER NAV OWNER OK late=discarded base=sorted details=sorted source=immutable mutation=rejected native-join=yes cancel-drained=yes");
     return true;
+}
+
+fn iconFixture(color: u32) [86]u8 {
+    var bytes: [86]u8 = @splat(0);
+    std.mem.writeInt(u16, bytes[2..4], 1, .little);
+    std.mem.writeInt(u16, bytes[4..6], 1, .little);
+    bytes[6] = 2;
+    bytes[7] = 2;
+    std.mem.writeInt(u16, bytes[10..12], 1, .little);
+    std.mem.writeInt(u16, bytes[12..14], 32, .little);
+    std.mem.writeInt(u32, bytes[14..18], 64, .little);
+    std.mem.writeInt(u32, bytes[18..22], 22, .little);
+    std.mem.writeInt(u32, bytes[22..26], 40, .little);
+    std.mem.writeInt(u32, bytes[26..30], 2, .little);
+    std.mem.writeInt(u32, bytes[30..34], 4, .little);
+    std.mem.writeInt(u16, bytes[34..36], 1, .little);
+    std.mem.writeInt(u16, bytes[36..38], 32, .little);
+    std.mem.writeInt(u32, bytes[42..46], 24, .little);
+    for (0..4) |index| std.mem.writeInt(u32, bytes[62 + index * 4 ..][0..4], color | 0xff000000, .little);
+    return bytes;
+}
+fn iconJoined(sys: *const r4os.r4sys.Context, owner: *dialog_app.ShortcutIcons) ?*dialog_app.ShortcutIcons.Job {
+    const deadline = sys.ticks() +| sys.ticksFromMilliseconds(10000);
+    while (sys.ticks() < deadline) {
+        if (owner.collectJoined(sys)) |job| return job;
+        sys.sleepTicks(1);
+    }
+    return null;
+}
+fn iconLoad(sys: *const r4os.r4sys.Context, owner: *dialog_app.ShortcutIcons, path: [128]u8) bool {
+    const wanted = [_][128]u8{path};
+    owner.setWanted(&wanted, 1);
+    _ = owner.refresh(sys);
+    owner.afterPublish(sys);
+    if (owner.job == null) return owner.store.find(std.mem.sliceTo(&path, 0)) != null;
+    const job = iconJoined(sys, owner) orelse return false;
+    const accepted = owner.applyJoined(sys, job);
+    dialog_app.ShortcutIcons.destroy(sys, job);
+    return accepted;
+}
+fn iconsNativeSelfTest(sys: *const r4os.r4sys.Context, identity: r4os.abi.ProgramJoinHandle) bool {
+    const C = dialog_app.ShortcutIcons;
+    var root: [128:0]u8 = undefined;
+    _ = std.fmt.bufPrintZ(&root, "C:\\TEMP\\EXPIC-{d}-{x}", .{ identity.instance_id, identity.instance_generation }) catch return iconFailure(sys, 235);
+    if (sys.exists(&root) or sys.dirCreate(&root) <= 0) return iconFailure(sys, 236);
+    var paths: [65][128]u8 = @splat(@splat(0));
+    var created: usize = 0;
+    var cleaned = false;
+    defer if (!cleaned) {
+        for (paths[0..created]) |*path| {
+            _ = sys.fileDelete(@ptrCast(path));
+        }
+        _ = sys.dirDelete(&root);
+    };
+    const original = iconFixture(0x123456);
+    for (&paths, 0..) |*path, index| {
+        _ = std.fmt.bufPrintZ(path, "{s}\\I{d:0>2}.ICO", .{ std.mem.sliceTo(&root, 0), index }) catch return iconFailure(sys, 248);
+        if (index == 2) {
+            var larger: [5000]u8 = @splat(0);
+            @memcpy(larger[0..original.len], &original);
+            if (sys.fileWrite(@ptrCast(path), &larger) != larger.len) return iconFailure(sys, 252);
+        } else if (sys.fileWrite(@ptrCast(path), &original) != original.len) return iconFailure(sys, 253);
+        created += 1;
+    }
+    const owner = sys.allocator().create(C) catch return iconFailure(sys, 256);
+    defer sys.allocator().destroy(owner);
+    owner.* = .{};
+    defer owner.drain(sys);
+    if (!iconLoad(sys, owner, paths[0])) return iconFailure(sys, 260);
+    const image = owner.image(std.mem.sliceTo(&paths[0], 0)) orelse return iconFailure(sys, 261);
+    if (image.width != 2 or image.height != 2 or image.pixels[0] != 0x123456) return iconFailure(sys, 262);
+    var commands: [2]r4os.abi.GuiFrameCommand = undefined;
+    var resources: [16]u8 = undefined;
+    var frame = r4os.gui.FrameCanvas.init(undefined, &commands, &resources, true);
+    if (frame.raster(0, 0, 2, 2, 1, image.pixels[0..4]) < 0) return iconFailure(sys, 266);
+    const generation = owner.generation;
+    for (0..128) |_| {
+        if (owner.poll(sys)) return iconFailure(sys, 269);
+        const cached = owner.image(std.mem.sliceTo(&paths[0], 0)) orelse return iconFailure(sys, 270);
+        if (cached.pixels[0] != 0x123456) return iconFailure(sys, 271);
+        owner.afterPublish(sys);
+        if (owner.job != null or owner.generation != generation) return iconFailure(sys, 273);
+    }
+    // A second retained mount token must be checked even while the global
+    // publication epoch and the first root are still valid. This is a real
+    // kernel stale-token rejection, not a physical remount claim.
+    var retired = owner.store.slots[owner.store.find(std.mem.sliceTo(&paths[0], 0)).?].record;
+    retired.path = dialog_app.shortcut_icons.normalized("Z:\\STALE.ICO").?;
+    retired.stamp.watch.mount_generation +%= 1;
+    if (retired.stamp.watch.mount_generation == 0) retired.stamp.watch.mount_generation = 1;
+    owner.store.insert(&retired);
+    if (!owner.refresh(sys) or owner.store.find(std.mem.sliceTo(&paths[0], 0)) != null) return iconFailure(sys, 283);
+    const second = [_][128]u8{paths[1]};
+    owner.setWanted(&second, 1);
+    owner.afterPublish(sys);
+    const delayed = iconJoined(sys, owner) orelse return iconFailure(sys, 287);
+    const changed = iconFixture(0x445566);
+    if (sys.fileWrite(@ptrCast(&paths[1]), &changed) != changed.len) {
+        C.destroy(sys, delayed);
+        return iconFailure(sys, 291);
+    }
+    const stale_refused = !owner.applyJoined(sys, delayed);
+    C.destroy(sys, delayed);
+    if (!stale_refused or !iconLoad(sys, owner, paths[1])) return iconFailure(sys, 295);
+    if ((owner.image(std.mem.sliceTo(&paths[1], 0)) orelse return iconFailure(sys, 296)).pixels[0] != 0x445566) return iconFailure(sys, 296);
+    if (sys.fileDelete(@ptrCast(&paths[1])) <= 0 or !owner.refresh(sys)) return iconFailure(sys, 297);
+    if (!iconLoad(sys, owner, paths[1]) or owner.image(std.mem.sliceTo(&paths[1], 0)) != null) return iconFailure(sys, 298);
+    const negative_generation = owner.generation;
+    for (0..16) |_| {
+        owner.afterPublish(sys);
+        if (owner.job != null or owner.generation != negative_generation) return iconFailure(sys, 302);
+    }
+    const recreated = iconFixture(0x778899);
+    if (sys.fileWrite(@ptrCast(&paths[1]), &recreated) != recreated.len or !owner.refresh(sys) or !iconLoad(sys, owner, paths[1])) return iconFailure(sys, 305);
+    if ((owner.image(std.mem.sliceTo(&paths[1], 0)) orelse return iconFailure(sys, 306)).pixels[0] != 0x778899) return iconFailure(sys, 306);
+    for (paths, 0..) |path, index| {
+        if (!iconLoad(sys, owner, path)) return iconFailure(sys, 308);
+        const cached = owner.image(std.mem.sliceTo(&path, 0));
+        if (index == 2) {
+            // Whole-file fileRead refuses a5KB file in the existing4KB
+            // buffer. A known negative is correct and must not retry.
+            if (cached != null) return iconFailure(sys, 309);
+            const bounded_generation = owner.generation;
+            owner.afterPublish(sys);
+            if (owner.job != null or owner.generation != bounded_generation) return iconFailure(sys, 309);
+        } else if (cached == null) return iconFailure(sys, 309);
+    }
+    if (owner.store.find(std.mem.sliceTo(&paths[0], 0)) != null or owner.store.find(std.mem.sliceTo(&paths[64], 0)) == null) return iconFailure(sys, 311);
+    for (0..4) |index| if (std.mem.readInt(u32, resources[index * 4 ..][0..4], .little) != 0x123456) return iconFailure(sys, 312);
+    const evicted = [_][128]u8{paths[0]};
+    owner.setWanted(&evicted, 1);
+    owner.afterPublish(sys);
+    if (owner.job == null) return iconFailure(sys, 316);
+    owner.setWanted(&.{}, 2);
+    owner.drain(sys);
+    if (owner.busy()) return iconFailure(sys, 319);
+    for (&paths) |*path| if (sys.fileDelete(@ptrCast(path)) <= 0) return iconFailure(sys, 320);
+    if (sys.dirDelete(&root) <= 0) return iconFailure(sys, 321);
+    cleaned = true;
+    sys.println("EXPLORER ICON OWNER OK repeat=128/no-new-job late-mutation=rejected edit=updated delete=negative recreate=updated lru=64/65 oversize=5000/4096-standard stale-mount=rejected pixel-copy=stable native-join=yes cancel-drained=yes cleanup=complete");
+    return true;
+}
+
+fn iconFailure(sys: *const r4os.r4sys.Context, line: u32) bool {
+    sys.write("EXPLORER ICON FAILED line=");
+    sys.printU64(line);
+    sys.println("");
+    return false;
 }

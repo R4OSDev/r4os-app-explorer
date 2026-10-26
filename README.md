@@ -115,3 +115,21 @@ checks the actual owners, sort budgets, page boundaries and selection identity.
 The same-source EXPTEXT fixture adds native joins/late-result/mutation/drain
 checks. SPECTRA CHECK DESKTOP /HOST /NAV explicitly checks real GUI input and
 close during current product work. These checks do not measure physical latency.
+
+Shortcut pixel ownership (0.87.45)
+----------------------------------
+Visible shortcut icons use a64-entry decoded-pixel LRU. Main paints only
+cached pixels or the standard icon. A copied BSP job loads/decodes outside
+painting and is really joined before insertion/free. FileInfo identity and
+exact mount/global-publication cursors guard adoption/invalidation; negative
+results cache too. Unavailable mount/admission waits an explicit refresh.
+No storage inventory or file I/O runs in icon painting; without shortcut
+demand the cache performs no system metadata calls. Pixels are owned, bounded
+to32x32/4096 whole-file bytes, and copied into GUI resources before eviction.
+The old unreachable detail renderer was removed after caller proof; existing
+generation-owned shortcut metadata supplies title/icon/validity.
+Build.sh shortcut-icons-test navigation-test drive-free-test dialog-text-test
+(Build.bat on Windows) covers the actual owners. EXPTEXT adds native jobs,
+late-result rejection, negative/update/delete/recreate, stale mount token,
+64/65 LRU, oversize standard, copied pixels and cancel/drain. Explicit
+SPECTRA CHECK DESKTOP /HOST /NAV /ICONS covers real product frame resources.

@@ -31,4 +31,8 @@ pub fn build(b: *std.Build) void {
     navigation_root.addImport("r4os", host);
     const navigation_cases = b.addTest(.{ .root_module = navigation_root });
     b.step("navigation-test", "Bounded generation-owned directory jobs and ordering").dependOn(&b.addRunArtifact(navigation_cases).step);
+    const icons_root = b.createModule(.{ .root_source_file = b.path("src/shortcut_icons.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    icons_root.addImport("r4os", host);
+    const icons_cases = b.addTest(.{ .root_module = icons_root });
+    b.step("shortcut-icons-test", "Owned bounded icon pixels, negative LRU and GUI transport").dependOn(&b.addRunArtifact(icons_cases).step);
 }
