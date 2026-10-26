@@ -1,6 +1,7 @@
 const r4os = @import("r4os");
 const r4std = @import("r4std");
 const std = @import("std");
+pub const drive_free = @import("drive_free.zig");
 const AppApi = struct {
     sys: r4os.r4sys.Context,
     desk: r4os.r4desk.Context,
@@ -245,6 +246,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
 
 const App = struct {
     ctx: *AppApi,
+    free_query: drive_free.Owner = .{},
     hosted_w: i32 = 420,
     hosted_h: i32 = 260,
     initialized: bool = false,
@@ -292,6 +294,7 @@ const App = struct {
     current_drive: r4os.abi.DriveInfo = .{},
     current_path: [128]u8 = .{0} ** 128,
     status: [80]u8 = .{0} ** 80,
+    directory_status: [80]u8 = .{0} ** 80,
     entries: [max_entries]Entry = .{Entry{}} ** max_entries,
     snapshot: r4os.directory_page.Snapshot(Entry, 16 * 1024 * 1024) = .{},
     snapshot_path: [128]u8 = .{0} ** 128,
@@ -319,6 +322,7 @@ const App = struct {
 
     fn runHosted(self: *App) i32 {
         defer self.snapshot.deinit(self.ctx.sys.allocator());
+        defer self.free_query.drain(&self.ctx.sys);
         _ = self.ctx.desk.guiSetTitle("Explorer");
         self.setExplorerMinFrameSize();
         self.init();
@@ -332,7 +336,26 @@ const App = struct {
         // are not used here. File/directory cursors remain demand-checked.
         events.subscriptions = 0;
         while (!self.quit_requested and !self.ctx.sys.programShouldClose()) {
-            switch (events.wait(r4os.time_contract.timeoutForever())) {
+            if (self.free_query.poll(&self.ctx.sys)) |completion| {
+                if (completion.info) |free_info| self.current_drive = free_info;
+                if (self.view_mode == .directory and std.mem.eql(u8, spanZ(&self.status), spanZ(&self.directory_status))) self.updateDirectoryStatus();
+                self.render();
+            }
+            // A stale joined job may have held the lane when this generation's
+            // frame was published. Resume only after that successful frame.
+            const before_admission = self.free_query.state;
+            if (self.painted) self.free_query.afterPublish(&self.ctx.sys);
+            if (before_admission != self.free_query.state) {
+                // Allocation/thread admission can fail after publication. Make
+                // that terminal state visible without waiting for user input.
+                if (self.view_mode == .directory and std.mem.eql(u8, spanZ(&self.status), spanZ(&self.directory_status))) self.updateDirectoryStatus();
+                self.render();
+            }
+            const wait = if (self.free_query.busy())
+                r4os.time_contract.timeoutFinite(.{ .nanoseconds = 1_000_000 })
+            else
+                r4os.time_contract.timeoutForever();
+            switch (events.wait(wait)) {
                 .message => |message| {
                     const event = message.guiEvent() orelse continue;
                     const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
@@ -1139,7 +1162,12 @@ const App = struct {
         }, scratch);
         _ = canvas.label(.{
             .rect = .{ .x = rect.x + 8, .y = rect.y + 90, .w = rect.w - 16, .h = 14 },
-            .text = driveSizeLine(line[0..], "Free: ", self.current_drive.free_bytes),
+            .text = switch (self.free_query.state) {
+                .ready => driveSizeLine(line[0..], "Free: ", self.current_drive.free_bytes),
+                .pending => "Free: calculating...",
+                .unknown => "Free: unknown",
+                .unavailable => "Free: unavailable",
+            },
             .fg = black,
             .bg = panel_bg,
         }, scratch);
@@ -1361,7 +1389,7 @@ const App = struct {
             self.snapshot_path = self.current_path;
             self.snapshot_mode = self.sort_mode;
             self.snapshot_ascending = self.sort_ascending;
-            self.snapshot_valid = watched; // Old ABI rebuilds on every request.
+            self.snapshot_valid = watched; // Unobserved snapshots demand-rebuild; exact FREE stays unavailable.
         }
         const all = self.snapshot.values.items;
         var start: usize = 0;
@@ -1399,6 +1427,7 @@ const App = struct {
     }
 
     fn loadComputerView(self: *App) void {
+        self.free_query.clear();
         self.entry_count = 0;
         self.selected_index = no_selection;
         self.select_all_active = false;
@@ -1415,7 +1444,7 @@ const App = struct {
 
         var index: u8 = 0;
         while (index < 26 and self.entry_count < self.entries.len) : (index += 1) {
-            const info = self.ctx.sys.driveInfo(index) orelse continue;
+            const info = self.ctx.sys.driveInfoGeometry(index) orelse continue;
             if (info.mounted == 0) continue;
             var entry = Entry{ .kind = entry_kind_drive, .info_valid = true, .attr = 0, .size = info.bytes };
             entry.modified_time = 0;
@@ -1467,9 +1496,20 @@ const App = struct {
     }
 
     fn loadCurrentDriveInfo(self: *App) r4os.abi.DriveInfo {
+        // A frame for the previous navigation generation cannot admit work for
+        // this one. Only a successful render can reopen the publication gate.
+        self.painted = false;
         const letter = driveRootLetter(spanZ(self.current_path[0..]));
-        if (letter < 'A' or letter > 'Z') return .{};
-        return self.ctx.sys.driveInfo(letter - 'A') orelse .{ .letter = letter };
+        if (letter < 'A' or letter > 'Z') {
+            self.free_query.clear();
+            return .{};
+        }
+        const info = self.ctx.sys.driveInfoGeometry(letter - 'A') orelse {
+            self.free_query.clear();
+            return .{ .letter = letter };
+        };
+        self.free_query.request(info, if (self.snapshot_valid) self.snapshot_watch else .{});
+        return info;
     }
 
     fn openSelected(self: *App) void {
@@ -1949,7 +1989,7 @@ const App = struct {
             setZ(self.status[0..], "Path is not a drive path");
             return;
         }
-        const info = self.ctx.sys.driveInfo(letter - 'A') orelse {
+        const info = self.ctx.sys.driveInfoGeometry(letter - 'A') orelse {
             setZ(self.status[0..], "Drive not mounted");
             return;
         };
@@ -2018,7 +2058,7 @@ const App = struct {
         self.clearPendingPaste();
         const upper = asciiUpper(letter);
         const index: u32 = if (upper >= 'A' and upper <= 'Z') upper - 'A' else 0;
-        const info = self.ctx.sys.driveInfo(index) orelse {
+        const info = self.ctx.sys.driveInfoGeometry(index) orelse {
             setZ(self.status[0..], "Drive not mounted");
             self.render();
             return;
@@ -2042,7 +2082,7 @@ const App = struct {
         var step: u8 = 1;
         while (step < 26) : (step += 1) {
             const index: u8 = @intCast((@as(u16, current_index) + step) % 26);
-            if (self.ctx.sys.driveInfo(index)) |info| {
+            if (self.ctx.sys.driveInfoGeometry(index)) |info| {
                 if (driveBrowsable(info.kind)) {
                     var path: [4]u8 = .{0} ** 4;
                     setDriveRoot(path[0..], info.letter);
@@ -2110,11 +2150,16 @@ const App = struct {
         appendZ(self.status[0..], " sorted ");
         appendZ(self.status[0..], sortModeName(self.sort_mode));
         appendZ(self.status[0..], if (self.sort_ascending) " asc" else " desc");
-        if (self.current_drive.free_bytes > 0) {
+        if (self.free_query.state == .ready) {
             var size_buf: [24]u8 = .{0} ** 24;
             appendZ(self.status[0..], " free ");
             appendByteSize(self.status[0..], size_buf[0..], self.current_drive.free_bytes);
+        } else if (self.free_query.state == .pending) {
+            appendZ(self.status[0..], " free calculating...");
+        } else {
+            appendZ(self.status[0..], " free unknown");
         }
+        self.directory_status = self.status;
     }
 
     fn updateComputerStatus(self: *App) void {
@@ -3081,6 +3126,15 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context) i32 {
 }
 
 fn runFileSelfTest(ctx: *const r4os.r4sys.Context) i32 {
+    const c_geometry = ctx.driveInfoGeometry('C' - 'A') orelse return explorerFail(ctx, "geometry-c");
+    const d_geometry = ctx.driveInfoGeometry('D' - 'A') orelse return explorerFail(ctx, "geometry-d");
+    if (c_geometry.free_bytes != 0 or c_geometry.free_clusters != 0 or c_geometry.reserved != 0 or
+        d_geometry.free_bytes != 0 or d_geometry.free_clusters != 0 or d_geometry.reserved != 0)
+        return explorerFail(ctx, "geometry-free-unknown");
+    const c_info = ctx.driveInfo('C' - 'A') orelse return explorerFail(ctx, "drive-c");
+    if (c_info.reserved & r4os.abi.drive_info_flag_free_valid == 0 or
+        c_info.bytes != c_geometry.bytes or c_info.cluster_bytes != c_geometry.cluster_bytes or c_info.total_clusters != c_geometry.total_clusters)
+        return explorerFail(ctx, "geometry-full-c");
     // The probe namespace belongs to this exact process generation. Never
     // remove or overwrite an existing path in order to prepare a selftest.
     var identity: r4os.abi.ProgramJoinHandle = .{};
@@ -3140,7 +3194,7 @@ fn runFileSelfTest(ctx: *const r4os.r4sys.Context) i32 {
     return 0;
 }
 
-fn createProbeFile(files: r4os.app_storage.Files, path: *[128:0]u8, bytes: []const u8) bool {
+pub fn createProbeFile(files: r4os.app_storage.Files, path: *[128:0]u8, bytes: []const u8) bool {
     var writer = switch (files.streamWriter(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) }, r4os.abi.file_stream_open_create)) {
         .writer => |value| value,
         .failure => return false,

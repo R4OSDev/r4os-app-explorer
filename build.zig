@@ -23,4 +23,8 @@ pub fn build(b: *std.Build) void {
     root.addImport("r4std", binding);
     const cases = b.addTest(.{ .root_module = root, .filters = &.{"dialog owner"} });
     b.step("dialog-text-test", "Actual Explorer Unicode rename and bounded paste owner").dependOn(&b.addRunArtifact(cases).step);
+    const free_root = b.createModule(.{ .root_source_file = b.path("src/drive_free.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    free_root.addImport("r4os", host);
+    const free_cases = b.addTest(.{ .root_module = free_root });
+    b.step("drive-free-test", "Actual Explorer generation and exact/unknown free-space owner").dependOn(&b.addRunArtifact(free_cases).step);
 }
