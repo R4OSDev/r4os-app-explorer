@@ -436,6 +436,13 @@ const App = struct {
                             self.updateHostedMetrics(info);
                             self.render();
                         },
+                        .input_reset, .focus_lost => {
+                            const repaint = self.menubar_state.isOpen();
+                            self.menubar_state.close();
+                            self.last_click_index = no_selection;
+                            self.last_click_tick = 0;
+                            if (repaint) self.render();
+                        },
                         .mouse_down => self.handleMouseDown(event.x, event.y, event.tick),
                         .mouse_up => self.handleMouseUp(event.x, event.y),
                         .mouse_move => self.handleMouseMove(event.x, event.y),
