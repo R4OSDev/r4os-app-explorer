@@ -2,7 +2,7 @@ const r4os = @import("r4os");
 const dialog_app = @import("dialog_app");
 const drive_free = dialog_app.drive_free;
 const std = @import("std");
-pub fn r4_app_main(app: *r4os.App) i32 {
+pub fn r4_app_main(app: *r4os.App2) i32 {
     const code = dialog_app.r4_app_main(app);
     if (code != 0) return code;
     const sys = app.system();
@@ -19,7 +19,58 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     const geometry = sys.driveInfoGeometry('C' - 'A') orelse return 1;
     if (!freeOwnerNativeSelfTest(&sys, geometry, identity)) return 1;
     if (!navigationNativeSelfTest(&sys, identity)) return 1;
-    return if (iconsNativeSelfTest(&sys, identity)) 0 else 1;
+    if (!iconsNativeSelfTest(&sys, identity)) return 1;
+    return if (clipboardNativeSelfTest(app, identity)) 0 else 1;
+}
+
+fn clipboardNativeSelfTest(app: *r4os.App2, identity: r4os.abi.ProgramJoinHandle) bool {
+    const sys = app.system();
+    const files = r4os.app_storage.Files{ .sys = sys };
+    var path: [128:0]u8 = undefined;
+    _ = std.fmt.bufPrintZ(&path, "C:\\TEMP\\EXPC-{d}-{x}.TXT", .{ identity.instance_id, identity.instance_generation }) catch return false;
+    const file_path = r4os.app_storage.PathZ{ .ptr = &path, .len = @intCast(std.mem.sliceTo(&path, 0).len) };
+    if (files.metadata(file_path) != .missing) return false;
+    if (!dialog_app.createProbeFile(files, &path, "Copied file offer source\n")) return false;
+    defer _ = files.delete(file_path);
+    const before = switch (files.metadata(file_path)) {
+        .found => |value| value,
+        else => return false,
+    };
+    if (before.flags & r4os.abi.file_metadata2_flag_identity_valid == 0) return false;
+    var publisher: dialog_app.clipboard.Owner = .{};
+    var reader: dialog_app.clipboard.Owner = .{};
+    defer _ = publisher.close();
+    defer _ = reader.close();
+    if (publisher.connect(app) != 0 or reader.connect(app) != 0) return false;
+    var wire: [136]u8 = undefined;
+    const encoded = dialog_app.clipboard.encodeFile(std.mem.sliceTo(&path, 0), &wire) catch return false;
+    var committed: r4os.clipboard_offer.Lease = undefined;
+    if (publisher.publish(r4os.abi.clipboard_offer_format_file_list, encoded, &committed) != 0) return false;
+    var received: [136]u8 = undefined;
+    var snapshot: r4os.clipboard_offer.Lease = undefined;
+    const count = reader.read(r4os.abi.clipboard_offer_format_file_list, &received, &snapshot);
+    if (count <= 0 or snapshot.provider != committed.provider or snapshot.revision != committed.revision or reader.snapshot != null) return false;
+    var decoded: [128]u8 = undefined;
+    const copied = dialog_app.clipboard.decodeFile(received[0..@intCast(count)], &decoded) catch return false;
+    if (!std.mem.eql(u8, copied, std.mem.sliceTo(&path, 0))) return false;
+    const after = switch (files.metadata(file_path)) {
+        .found => |value| value,
+        else => return false,
+    };
+    if (!std.meta.eql(before, after)) return false;
+    var text: [8192]u8 = @splat('T');
+    const suffix = "Ä中-66";
+    @memcpy(text[text.len - suffix.len ..], suffix);
+    if (publisher.publish(r4os.abi.clipboard_offer_format_text_utf8, &text, &committed) != 0) return false;
+    var short: [5]u8 = @splat(0xa5);
+    if (reader.read(r4os.abi.clipboard_offer_format_text_utf8, &short, &snapshot) != r4os.abi.clipboard_offer_error_too_large or
+        reader.snapshot != null or !std.mem.allEqual(u8, &short, 0xa5)) return false;
+    var whole: [8192]u8 = undefined;
+    if (reader.read(r4os.abi.clipboard_offer_format_text_utf8, &whole, &snapshot) != text.len or !std.mem.eql(u8, &whole, &text) or reader.snapshot != null) return false;
+    if (publisher.pending != null) return false;
+    if (publisher.close() < 0 or reader.close() < 0) return false;
+    sys.println("EXPLORER OFFER OWNER OK file-list=whole identity=exact text8192=exact short=no-write release=ack channels=closed");
+    return true;
 }
 
 fn waitFreeJoined(ctx: *const r4os.r4sys.Context, owner: *drive_free.Owner) ?drive_free.Joined {
@@ -39,7 +90,7 @@ fn freeOwnerNativeSelfTest(ctx: *const r4os.r4sys.Context, geometry: r4os.abi.Dr
     _ = std.fmt.bufPrintZ(&path, "C:\\TEMP\\EXP-FREE-{d}-{x}.TXT", .{ identity.instance_id, identity.instance_generation }) catch return false;
     const files: r4os.app_storage.Files = .{ .sys = ctx.* };
     const file_path: r4os.app_storage.PathZ = .{ .ptr = &path, .len = @intCast(std.mem.sliceTo(&path, 0).len) };
-    if (files.info(file_path) != .missing) return false;
+    if (files.metadata(file_path) != .missing) return false;
     var owned = false;
     defer if (owned) {
         _ = files.delete(file_path);
@@ -101,23 +152,29 @@ fn navJoined(sys: *const r4os.r4sys.Context, owner: *dialog_app.Navigation) ?*di
 }
 
 // Fixture-only: actual BSP workers and kernel joins, not a producer done flag.
+fn navigationFailure(sys: *const r4os.r4sys.Context, line: u32) bool {
+    var message: [128]u8 = undefined;
+    sys.println(std.fmt.bufPrint(&message, "EXPLORER NAV OWNER FAILED line={d}", .{line}) catch "EXPLORER NAV OWNER FAILED");
+    return false;
+}
+
 fn navigationNativeSelfTest(sys: *const r4os.r4sys.Context, identity: r4os.abi.ProgramJoinHandle) bool {
     const N = dialog_app.Navigation;
     var root: [128:0]u8 = undefined;
-    _ = std.fmt.bufPrintZ(&root, "C:\\TEMP\\EXPN-{d}-{x}", .{ identity.instance_id, identity.instance_generation }) catch return false;
-    if (sys.exists(&root) or sys.dirCreate(&root) <= 0) return false;
+    _ = std.fmt.bufPrintZ(&root, "C:\\TEMP\\EXPN-{d}-{x}", .{ identity.instance_id, identity.instance_generation }) catch return navigationFailure(sys, @src().line);
+    if (sys.exists(&root) or sys.dirCreate(&root) <= 0) return navigationFailure(sys, @src().line);
     var first: [128:0]u8 = undefined;
     var second: [128:0]u8 = undefined;
     var left: [128:0]u8 = undefined;
     var right: [128:0]u8 = undefined;
     var only: [128:0]u8 = undefined;
     var mutation: [128:0]u8 = undefined;
-    _ = std.fmt.bufPrintZ(&first, "{s}\\OLD", .{std.mem.sliceTo(&root, 0)}) catch return false;
-    _ = std.fmt.bufPrintZ(&second, "{s}\\NEW", .{std.mem.sliceTo(&root, 0)}) catch return false;
-    _ = std.fmt.bufPrintZ(&left, "{s}\\A.LNK", .{std.mem.sliceTo(&first, 0)}) catch return false;
-    _ = std.fmt.bufPrintZ(&right, "{s}\\Z.LNK", .{std.mem.sliceTo(&first, 0)}) catch return false;
-    _ = std.fmt.bufPrintZ(&only, "{s}\\ONLY.TXT", .{std.mem.sliceTo(&second, 0)}) catch return false;
-    _ = std.fmt.bufPrintZ(&mutation, "{s}\\MUTATE.TXT", .{std.mem.sliceTo(&first, 0)}) catch return false;
+    _ = std.fmt.bufPrintZ(&first, "{s}\\OLD", .{std.mem.sliceTo(&root, 0)}) catch return navigationFailure(sys, @src().line);
+    _ = std.fmt.bufPrintZ(&second, "{s}\\NEW", .{std.mem.sliceTo(&root, 0)}) catch return navigationFailure(sys, @src().line);
+    _ = std.fmt.bufPrintZ(&left, "{s}\\A.LNK", .{std.mem.sliceTo(&first, 0)}) catch return navigationFailure(sys, @src().line);
+    _ = std.fmt.bufPrintZ(&right, "{s}\\Z.LNK", .{std.mem.sliceTo(&first, 0)}) catch return navigationFailure(sys, @src().line);
+    _ = std.fmt.bufPrintZ(&only, "{s}\\ONLY.TXT", .{std.mem.sliceTo(&second, 0)}) catch return navigationFailure(sys, @src().line);
+    _ = std.fmt.bufPrintZ(&mutation, "{s}\\MUTATE.TXT", .{std.mem.sliceTo(&first, 0)}) catch return navigationFailure(sys, @src().line);
     defer {
         _ = sys.fileDelete(&left);
         _ = sys.fileDelete(&right);
@@ -127,10 +184,10 @@ fn navigationNativeSelfTest(sys: *const r4os.r4sys.Context, identity: r4os.abi.P
         _ = sys.dirDelete(&second);
         _ = sys.dirDelete(&root);
     }
-    if (sys.dirCreate(&first) <= 0 or sys.dirCreate(&second) <= 0) return false;
+    if (sys.dirCreate(&first) <= 0 or sys.dirCreate(&second) <= 0) return navigationFailure(sys, @src().line);
     const beta = "R4S_FORMAT=1\nSCHEMA=R4LNK\nTARGET=C:\\AUTOEXEC.BAT\nTITLE=Beta\n";
     const alpha = "R4S_FORMAT=1\nSCHEMA=R4LNK\nTARGET=C:\\AUTOEXEC.BAT\nTITLE=Alpha\n";
-    if (sys.fileWrite(&left, beta) != beta.len or sys.fileWrite(&right, alpha) != alpha.len or sys.fileWrite(&only, "only") != 4) return false;
+    if (sys.fileWrite(&left, beta) != beta.len or sys.fileWrite(&right, alpha) != alpha.len or sys.fileWrite(&only, "only") != 4) return navigationFailure(sys, @src().line);
     const Config = @FieldType(N.Job, "config");
     const config = Config.initDefault();
     var owner: N = .{};
@@ -143,50 +200,50 @@ fn navigationNativeSelfTest(sys: *const r4os.r4sys.Context, identity: r4os.abi.P
     @memset(&next.location.path, 0);
     @memcpy(next.location.path[0..std.mem.sliceTo(&second, 0).len], std.mem.sliceTo(&second, 0));
     owner.request(sys, old);
-    if (owner.job != null or !owner.loading()) return false;
-    if (owner.afterPublish(sys, &config)) return false;
+    if (owner.job != null or !owner.loading()) return navigationFailure(sys, @src().line);
+    if (owner.afterPublish(sys, &config)) return navigationFailure(sys, @src().line);
     const deadline = sys.ticks() +| sys.ticksFromMilliseconds(10000);
     while (owner.job != null and !owner.job.?.done.load(.acquire) and sys.ticks() < deadline) sys.sleepTicks(1);
-    if (owner.job == null or !owner.job.?.done.load(.acquire)) return false;
+    if (owner.job == null or !owner.job.?.done.load(.acquire)) return navigationFailure(sys, @src().line);
     const late_generation = owner.job.?.key.generation;
     // Let a real completed worker arrive after its request has been superseded.
     owner.request(sys, next);
-    const late = navJoined(sys, &owner) orelse return false;
+    const late = navJoined(sys, &owner) orelse return navigationFailure(sys, @src().line);
     const discarded = late.key.generation == late_generation and !owner.current(late.key);
     N.destroy(sys, late);
-    if (!discarded or owner.afterPublish(sys, &config)) return false;
-    const latest = navJoined(sys, &owner) orelse return false;
+    if (!discarded or owner.afterPublish(sys, &config)) return navigationFailure(sys, @src().line);
+    const latest = navJoined(sys, &owner) orelse return navigationFailure(sys, @src().line);
     const latest_ok = owner.current(latest.key) and latest.result == .ok and N.valid(sys, latest) and latest.snapshot.values.items.len == 1 and
         std.mem.eql(u8, std.mem.sliceTo(&latest.snapshot.values.items[0].path, 0), std.mem.sliceTo(&only, 0));
     N.destroy(sys, latest);
-    if (!latest_ok) return false;
+    if (!latest_ok) return navigationFailure(sys, @src().line);
     owner.request(sys, old);
-    if (owner.afterPublish(sys, &config)) return false;
-    const base = navJoined(sys, &owner) orelse return false;
+    if (owner.afterPublish(sys, &config)) return navigationFailure(sys, @src().line);
+    const base = navJoined(sys, &owner) orelse return navigationFailure(sys, @src().line);
     if (base.result != .ok or !N.valid(sys, base) or base.snapshot.values.items.len != 2) {
         N.destroy(sys, base);
-        return false;
+        return navigationFailure(sys, @src().line);
     }
     published = base.snapshot;
     base.snapshot = .{};
     const original = published.values.items[0].label;
     owner.armDetails(base, published.values.items);
-    if (owner.afterPublish(sys, &config)) return false;
-    const details = navJoined(sys, &owner) orelse return false;
+    if (owner.afterPublish(sys, &config)) return navigationFailure(sys, @src().line);
+    const details = navJoined(sys, &owner) orelse return navigationFailure(sys, @src().line);
     const sorted = details.result == .ok and N.valid(sys, details) and details.snapshot.values.items.len == 2 and
         std.mem.eql(u8, std.mem.sliceTo(&details.snapshot.values.items[0].label, 0), "Alpha") and
         std.mem.eql(u8, std.mem.sliceTo(&details.snapshot.values.items[1].label, 0), "Beta") and std.mem.eql(u8, &published.values.items[0].label, &original);
     if (!sorted) {
         N.destroy(sys, details);
-        return false;
+        return navigationFailure(sys, @src().line);
     }
     const changed = sys.fileWrite(&mutation, "mutation") == 8 and !N.valid(sys, details);
     N.destroy(sys, details);
-    if (!changed) return false;
+    if (!changed) return navigationFailure(sys, @src().line);
     owner.request(sys, old);
-    if (owner.afterPublish(sys, &config)) return false;
+    if (owner.afterPublish(sys, &config)) return navigationFailure(sys, @src().line);
     owner.drain(sys);
-    if (owner.busy()) return false;
+    if (owner.busy()) return navigationFailure(sys, @src().line);
     sys.println("EXPLORER NAV OWNER OK late=discarded base=sorted details=sorted source=immutable mutation=rejected native-join=yes cancel-drained=yes");
     return true;
 }

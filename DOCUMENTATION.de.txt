@@ -18,10 +18,10 @@ Ergebnis:
     Artifacts\Modules\Explorer\EXPLORER.R4X
 
 Contract:
-- R4XStart-App-Entry ueber das SDK
+- R4XStart2-App-Entry ueber das SDK
 - App-Klasse: `gui`
-- Plattformimporte: `R4SYS`, `R4DESK`, `R4DRAW`, `R4NET`, `R4DEV`
-- Runtime-R4L: benoetigte R4STD-Schnittstellen
+- Plattformimporte `R4SYS:Query2:2`, `R4DESK:Query2:2`, `R4DRAW:Query2:2`
+- Runtime-R4L mit `R4STD:Query2:2` und den benoetigten fachlichen Schnittstellen
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\DESKTOP\EXPLORER.R4X`
 
 Bedienung:
@@ -110,3 +110,22 @@ Build.sh shortcut-icons-test (Windows Build.bat), originale Besitzerziele,
 EXPTEXT /SELFTEST /FILES und SPECTRA CHECK DESKTOP /HOST /NAV /ICONS.
 Fachbelege/Gueltigkeitsgrenzen: Docs/Desktop/README.txt.45 und
 Docs/Diagnostics/Spectra.txt.45. Kein physischer Latenz-/OssiPC-Nachweis.
+
+Plattformgeneration 2 (0.90.66)
+-------------------------------
+Die regulaere App nutzt App2, vollstaendige FileMetadata2-Records und ganze
+Directoryseiten. Worker behalten ihre taskgebundenen Scancursor. Main bindet
+bei der Uebernahme einen eigenen Cursor und vergleicht die kopierten Namespace-,
+Mount- und Aenderungsdaten. Auswahl und Shortcutcache behalten breite Identitaeten.
+
+Dateilisten kommen aus dem gemeinsamen CLIPSVC-Angebot. Der lokale Cut-Wunsch
+bindet die eigene bestaetigte Angebotsrevision und Quellmetadaten. Andere
+Instanzen verwenden das Angebot fuer Copy. Die Ueberschreibbestaetigung bindet
+Quelle, Ziel und Angebot. Dateioperationen erhalten die Quittung des vorhandenen
+transaktionalen Kopierbesitzers. Namensdialoge schneiden nach Commitquittung aus
+und uebernehmen ganze UTF8-Snapshots nach der bestaetigten Freigabe.
+
+Gemeinsame Zeit-, RPC-, Bytecursor- und Streamhelfer behandeln Frist und
+Bytepraefix. Die bestehenden Speicherbudgets sind 48 Bytes fuer den Namen und
+128 Bytes fuer den Pfad. Lokale und native Belege stehen in
+Docs/API/ConsumerMigration.txt und Research/API-ABI/Migration/0.90.66/.

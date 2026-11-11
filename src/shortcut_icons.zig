@@ -28,7 +28,7 @@ pub const Stamp = struct {
 };
 pub const Record = struct {
     path: [128]u8 = @splat(0),
-    identity: a.FileInfo = .{},
+    identity: a.FileMetadata2 = .{},
     stamp: Stamp = .{},
     image: Image = .{}, // Stable failure is deliberately a negative entry.
 };
@@ -42,6 +42,16 @@ pub fn normalized(path: []const u8) ?[128]u8 {
 }
 fn text(path: *const [128]u8) []const u8 {
     return std.mem.sliceTo(path, 0);
+}
+fn parentDirectory(path: []const u8) [128:0]u8 {
+    var parent: [128:0]u8 = @splat(0);
+    const separator = std.mem.lastIndexOfScalar(u8, path, '\\') orelse {
+        parent[0] = '.';
+        return parent;
+    };
+    const length = if (separator == 2 and path[1] == ':') 3 else separator;
+    @memcpy(parent[0..length], path[0..length]);
+    return parent;
 }
 fn equal(left: []const u8, right: []const u8) bool {
     return std.ascii.eqlIgnoreCase(left, right);
@@ -279,33 +289,35 @@ pub fn Owner(comptime decode: fn ([]const u8, []u32) ?Size) type {
         fn load(job: *Job) State {
             const sys = &job.sys;
             const path = text(&job.record.path);
-            var root: [4:0]u8 = .{ 'C', ':', '\\', 0 };
-            if (path.len >= 3 and path[1] == ':') root[0] = path[0];
-            if (sys.directoryChangeBegin(&root, &job.record.stamp.watch) != 0) return .unavailable;
-            const before = sys.fileInfoRaw(@ptrCast(&job.record.path), &job.record.identity);
-            // Relative paths retain this exact program's immutable cwd. Bind
-            // the resolved drive root too before any successful pixel read.
-            if (job.record.identity.drive >= 'A' and job.record.identity.drive <= 'Z') {
-                root[0] = job.record.identity.drive;
-                var target: a.DirectoryChangeCursor = .{};
-                if (sys.directoryChangeBegin(&root, &target) == 0) {
-                    if (target.sequence != job.record.stamp.watch.sequence or !job.record.stamp.valid(sys)) return .stale;
-                    job.record.stamp.watch = target;
-                } else return .unavailable;
-            } else return .unavailable;
-            // Unmounted/unknown drives are not negative-cached under another
-            // drive's identity. They retain the standard icon until refresh.
-            if (before <= 0 or job.record.identity.exists == 0 or job.record.identity.is_dir != 0 or
-                job.record.identity.size == 0 or job.record.identity.size > bytes_max)
+            const parent = parentDirectory(path);
+            if (sys.directoryChangeBegin(&parent, &job.record.stamp.watch) != 0) return .unavailable;
+            const files = r.app_storage.Files{ .sys = sys.* };
+            const file_path = r.app_storage.PathZ{ .ptr = @ptrCast(&job.record.path), .len = @intCast(path.len) };
+            job.record.identity = switch (files.metadata(file_path)) {
+                .found => |value| value,
+                .missing => return if (job.record.stamp.valid(sys)) .complete else .stale,
+                .failure => return .unavailable,
+            };
+            // Parent and metadata must identify the actual backing mount,
+            // including relative paths and the hidden BOOT namespace.
+            if (job.record.identity.flags & a.file_metadata2_flag_identity_valid == 0) return .unavailable;
+            if (job.record.identity.identity.mount_slot != job.record.stamp.watch.mount_slot or
+                job.record.identity.identity.mount_generation != job.record.stamp.watch.mount_generation) return .stale;
+            if (job.record.identity.flags & a.file_metadata2_flag_directory != 0 or
+                job.record.identity.flags & a.file_metadata2_flag_byte_size_valid == 0 or
+                job.record.identity.byte_size == 0 or job.record.identity.byte_size > bytes_max)
                 return if (job.record.stamp.valid(sys)) .complete else .stale;
             if (job.stopped.load(.acquire)) return .cancelled;
             var bytes: [bytes_max]u8 = undefined;
             const got = sys.fileRead(@ptrCast(&job.record.path), &bytes);
-            var after: a.FileInfo = .{};
-            if (sys.fileInfoRaw(@ptrCast(&job.record.path), &after) <= 0 or !sameFile(job.record.identity, after)) return .stale;
+            const after = switch (files.metadata(file_path)) {
+                .found => |value| value,
+                else => return .stale,
+            };
+            if (!sameFile(job.record.identity, after)) return .stale;
             // Existing whole-file contract and4KB decode budget. Oversize
             // files were handled above as stable standard-icon results.
-            if (got > 0 and got == job.record.identity.size) {
+            if (got > 0 and got == job.record.identity.byte_size) {
                 if (decode(bytes[0..@intCast(got)], &job.record.image.pixels)) |size| {
                     if (size.width != 0 and size.height != 0 and size.width <= 32 and size.height <= 32) {
                         job.record.image.loaded = true;
@@ -318,13 +330,15 @@ pub fn Owner(comptime decode: fn ([]const u8, []u32) ?Size) type {
         }
     };
 }
-fn sameFile(left: a.FileInfo, right: a.FileInfo) bool {
-    return left.exists == right.exists and left.is_dir == right.is_dir and left.drive == right.drive and left.attr == right.attr and
-        left.size == right.size and left.first_cluster == right.first_cluster and left.created_time == right.created_time and
-        left.created_date == right.created_date and left.modified_time == right.modified_time and left.modified_date == right.modified_date;
+fn sameFile(left: a.FileMetadata2, right: a.FileMetadata2) bool {
+    return left.flags & a.file_metadata2_flag_identity_valid != 0 and std.meta.eql(left, right);
 }
 
 test "icon store LRU owns pixels and negative entries without scratch references" {
+    try std.testing.expectEqualStrings("C:\\BOOT\\Icons", std.mem.sliceTo(&parentDirectory("C:\\BOOT\\Icons\\A.ICO"), 0));
+    try std.testing.expectEqualStrings("C:\\", std.mem.sliceTo(&parentDirectory("C:\\A.ICO"), 0));
+    try std.testing.expectEqualStrings("TEMP", std.mem.sliceTo(&parentDirectory("TEMP\\A.ICO"), 0));
+    try std.testing.expectEqualStrings(".", std.mem.sliceTo(&parentDirectory("A.ICO"), 0));
     var store: Store(2) = .{};
     var record: Record = .{ .path = normalized("C:/ICONS/../A.ICO").?, .image = .{ .loaded = true, .width = 1, .height = 1 } };
     record.image.pixels[0] = 0x123456;

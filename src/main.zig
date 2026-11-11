@@ -3,20 +3,19 @@ const r4std = @import("r4std");
 const std = @import("std");
 pub const drive_free = @import("drive_free.zig");
 pub const shortcut_icons = @import("shortcut_icons.zig");
+pub const clipboard = @import("clipboard.zig");
 const AppApi = struct {
+    app: *const r4os.App2,
     sys: r4os.r4sys.Context,
     desk: r4os.r4desk.Context,
     draw: r4os.r4draw.Context,
-    net: r4os.r4net.Context,
-    dev: r4os.r4dev.Context,
 
-    fn init(r4_app: *r4os.App) ?AppApi {
+    fn init(r4_app: *r4os.App2) ?AppApi {
         return .{
+            .app = r4_app,
             .sys = r4_app.system(),
             .desk = r4_app.desktop() orelse return null,
             .draw = r4_app.drawing() orelse return null,
-            .net = r4_app.networkLowLevel() orelse return null,
-            .dev = r4_app.devicesLowLevel() orelse return null,
         };
     }
 };
@@ -201,9 +200,9 @@ const Entry = struct {
     shortcut_known: bool = false,
     shortcut_icon: [128]u8 = .{0} ** 128,
     info_valid: bool = false,
-    attr: u8 = 0,
+    attr: u32 = 0,
     size: u64 = 0,
-    first_cluster: u32 = 0,
+    metadata: r4os.abi.FileMetadata2 = .{},
     modified_time: u16 = 0,
     modified_date: u16 = 0,
 };
@@ -242,10 +241,19 @@ const NavigationModel = struct {
         setDriveLabel(&entry.label, info.letter);
         return entry;
     }
-    pub fn item(record: *const r4os.abi.DirectoryBatchEntry) ?Entry {
+    pub fn item(record: *const r4os.abi.DirectoryMetadataEntry2) ?Entry {
         const path = spanZ(&record.path);
-        if (path.len >= 128 or record.info.exists == 0) return null;
-        var entry = Entry{ .kind = if (record.info.is_dir != 0) entry_kind_dir else entry_kind_file, .info_valid = true, .attr = record.info.attr, .size = record.info.size, .first_cluster = record.info.first_cluster, .modified_time = record.info.modified_time, .modified_date = record.info.modified_date };
+        const info = record.info;
+        if (path.len >= 128 or info.flags & r4os.abi.file_metadata2_flag_exists == 0) return null;
+        var entry = Entry{
+            .kind = if (info.flags & r4os.abi.file_metadata2_flag_directory != 0) entry_kind_dir else entry_kind_file,
+            .info_valid = info.flags & r4os.abi.file_metadata2_flag_byte_size_valid != 0,
+            .attr = info.attributes,
+            .size = info.byte_size,
+            .metadata = info,
+            .modified_time = if (info.flags & r4os.abi.file_metadata2_flag_dos_time_valid != 0) info.modified_time else 0,
+            .modified_date = if (info.flags & r4os.abi.file_metadata2_flag_dos_time_valid != 0) info.modified_date else 0,
+        };
         copyZ(&entry.path, path);
         copyZ(&entry.label, tailName(path));
         if (entry.kind == entry_kind_file and isShortcutPath(path)) {
@@ -278,8 +286,8 @@ const DecodedIcon = shortcut_icons.Size;
 const LoadedIconImage = shortcut_icons.Image;
 pub const ShortcutIcons = shortcut_icons.Owner(decodeShortcutIconBytes);
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    if (!r4std.init(r4_app.startContext())) return r4os.abi.err_no_group;
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
+    if (!r4std.init2(r4_app.startContext())) return r4os.abi.err_no_group;
     const sys = r4_app.system();
     // This console diagnostic needs only R4SYS and the imported R4STD helpers.
     // Avoid acquiring unused app contexts that may be busy with unrelated SMP
@@ -296,6 +304,7 @@ const App = struct {
     free_query: drive_free.Owner = .{},
     navigation: Navigation = .{},
     shortcut_assets: ShortcutIcons = .{},
+    clipboard_owner: clipboard.Owner = .{},
     navigation_retries: u8 = 0,
     display_generation: u64 = 0,
     selection_intent_generation: u64 = 0,
@@ -317,9 +326,14 @@ const App = struct {
     pending_delete_all: bool = false,
     pending_delete_path: [128]u8 = .{0} ** 128,
     copy_source_path: [128]u8 = .{0} ** 128,
+    copy_source_metadata: r4os.abi.FileMetadata2 = .{},
+    copy_source_offer: r4os.clipboard_offer.Lease = .{},
     copy_is_move: bool = false,
     pending_paste: bool = false,
     pending_paste_target: [128]u8 = .{0} ** 128,
+    pending_paste_metadata: ?r4os.abi.FileMetadata2 = null,
+    pending_paste_source: r4os.abi.FileMetadata2 = .{},
+    pending_paste_offer: r4os.clipboard_offer.Lease = .{},
     open_with_active: bool = false,
     open_with_index: usize = 0,
     open_with_path: [128]u8 = .{0} ** 128,
@@ -353,6 +367,7 @@ const App = struct {
     snapshot: r4os.directory_page.Snapshot(Entry, 16 * 1024 * 1024) = .{},
     snapshot_path: [128]u8 = .{0} ** 128,
     snapshot_watch: r4os.abi.DirectoryChangeCursor = .{},
+    snapshot_cursor: r4os.abi.DirectoryMetadataCursor2 = .{},
     snapshot_valid: bool = false,
     snapshot_mode: SortMode = .name,
     snapshot_ascending: bool = true,
@@ -375,6 +390,9 @@ const App = struct {
     }
 
     fn runHosted(self: *App) i32 {
+        defer {
+            if (self.clipboard_owner.close() < 0) self.ctx.sys.println("Explorer clipboard channel close failed");
+        }
         defer self.snapshot.deinit(self.ctx.sys.allocator());
         defer self.navigation.drain(&self.ctx.sys);
         defer self.shortcut_assets.drain(&self.ctx.sys);
@@ -700,7 +718,8 @@ const App = struct {
         if (self.iconIndexAt(x, y)) |index| {
             const old = self.selected_index;
             const old_all = self.select_all_active;
-            const is_double = self.last_click_index == index and self.last_click_tick != 0 and tick >= self.last_click_tick and tick - self.last_click_tick <= self.ctx.sys.ticksFromMilliseconds(double_click_ms);
+            const double_click_ticks = self.ctx.sys.timeoutTicks(r4os.time_contract.timeoutFinite(.{ .nanoseconds = double_click_ms * 1_000_000 })) catch 0;
+            const is_double = double_click_ticks != 0 and self.last_click_index == index and self.last_click_tick != 0 and tick >= self.last_click_tick and tick - self.last_click_tick <= double_click_ticks;
             if (index != self.selected_index) self.clearPendingDelete();
             self.select_all_active = false;
             self.selected_index = index;
@@ -1214,7 +1233,10 @@ const App = struct {
             return storage.inventory(&inventory) == 0 and inventory.generation == self.computer_inventory_generation;
         }
         var observed = self.snapshot_watch;
-        return self.ctx.sys.directoryChangePoll(&observed) == 0 and observed.sequence == self.snapshot_watch.sequence;
+        var cursor = self.snapshot_cursor;
+        var empty: [0]r4os.abi.DirectoryMetadataEntry2 = .{};
+        return r4os.metadata2.batch(&self.ctx.app.context, null, &cursor, &empty) >= 0 and
+            self.ctx.sys.directoryChangePoll(&observed) == 0 and observed.sequence == self.snapshot_watch.sequence;
     }
 
     fn guardCurrentEntries(self: *App) bool {
@@ -1253,7 +1275,8 @@ const App = struct {
             Navigation.destroy(&self.ctx.sys, job);
             return false;
         }
-        if (job.result != .ok or !Navigation.valid(&self.ctx.sys, job)) {
+        var main_cursor: r4os.abi.DirectoryMetadataCursor2 = .{};
+        if (job.result != .ok or !self.bindSnapshot(job, &main_cursor)) {
             const stale = job.result == .stale or (job.result == .ok);
             const key = job.key;
             Navigation.destroy(&self.ctx.sys, job);
@@ -1298,6 +1321,7 @@ const App = struct {
         self.snapshot_mode = self.sort_mode;
         self.snapshot_ascending = self.sort_ascending;
         self.snapshot_watch = job.watch;
+        self.snapshot_cursor = main_cursor;
         self.snapshot_valid = self.view_mode == .computer or job.watch.mount_generation != 0;
         self.computer_inventory_generation = job.inventory_generation;
         self.display_generation = job.key.generation;
@@ -1342,9 +1366,26 @@ const App = struct {
         return true;
     }
 
+    fn bindSnapshot(self: *App, job: *const Navigation.Job, output: *r4os.abi.DirectoryMetadataCursor2) bool {
+        if (job.key.location.mode == .computer) return Navigation.valid(&self.ctx.sys, job);
+        var reader = r4os.metadata2.Directory.init(&self.ctx.app.context, zptr(&job.key.location.path));
+        var first: [1]r4os.abi.DirectoryMetadataEntry2 = undefined;
+        switch (reader.next(&first)) {
+            .failure, .restart => return false,
+            .rows, .progress, .end => {},
+        }
+        const cursor = reader.cursor;
+        const watch = cursor.scan.change;
+        if (watch.mount_generation == 0 or cursor.namespace_generation != job.namespace_generation or
+            watch.mount_slot != job.watch.mount_slot or watch.mount_generation != job.watch.mount_generation or watch.sequence != job.watch.sequence) return false;
+        output.* = cursor;
+        return true;
+    }
+
     fn sameEntry(a: Entry, b: Entry) bool {
-        return a.kind == b.kind and a.info_valid and b.info_valid and a.first_cluster == b.first_cluster and a.size == b.size and
-            a.modified_date == b.modified_date and a.modified_time == b.modified_time and equalsIgnoreCase(spanZ(&a.path), spanZ(&b.path));
+        if (a.kind != b.kind or !a.info_valid or !b.info_valid or !equalsIgnoreCase(spanZ(&a.path), spanZ(&b.path))) return false;
+        if (a.kind == entry_kind_drive) return a.size == b.size;
+        return a.metadata.flags & r4os.abi.file_metadata2_flag_identity_valid != 0 and std.meta.eql(a.metadata, b.metadata);
     }
 
     fn readDirectoryPage(self: *App, direction: PageDirection) bool {
@@ -2174,14 +2215,24 @@ const App = struct {
             self.commitNameDialog();
             return;
         }
-        if (codepoint == r4os.gui.Key.ctrl_c) {
-            _ = self.name_input.copyToClipboard(&self.ctx.desk);
-        } else if (codepoint == r4os.gui.Key.ctrl_x) {
-            if (self.name_input.cutToClipboard(&self.ctx.desk)) self.name_input_valid = true;
+        if (codepoint == r4os.gui.Key.ctrl_c or codepoint == r4os.gui.Key.ctrl_x) {
+            if (self.clipboard_owner.connect(self.ctx.app) != 0) return;
+            const range = self.name_input.selectionRange();
+            const selected = if (self.name_input.hasSelection()) self.name_input.value()[range.start..range.end] else self.name_input.value();
+            var committed: r4os.clipboard_offer.Lease = undefined;
+            const result = self.clipboard_owner.publish(r4os.abi.clipboard_offer_format_text_utf8, selected, &committed);
+            if (result == 0 and codepoint == r4os.gui.Key.ctrl_x) {
+                if (self.name_input.hasSelection()) {
+                    _ = self.name_input.handleCodepointChecked(r4os.gui.Key.delete);
+                } else self.name_input.clear();
+                self.name_input_valid = true;
+            } else if (result != 0) setZ(&self.status, "Clipboard commit unconfirmed; input retained");
         } else if (codepoint == r4os.gui.Key.ctrl_v) {
-            var bytes: [r4os.abi.clipboard_max_text_bytes + 1]u8 = undefined;
-            const count = self.ctx.desk.clipboardRead(&bytes);
-            if (count <= 0 or count > bytes.len or !self.insertNameText(bytes[0..@intCast(@max(count, 0))])) {
+            var bytes: [48]u8 = undefined;
+            var snapshot: r4os.clipboard_offer.Lease = undefined;
+            const connected = self.clipboard_owner.connect(self.ctx.app);
+            const count = if (connected == 0) self.clipboard_owner.read(r4os.abi.clipboard_offer_format_text_utf8, &bytes, &snapshot) else connected;
+            if (count <= 0 or !self.insertNameText(bytes[0..@intCast(@max(count, 0))])) {
                 setZ(&self.status, "Paste invalid or too long; input retained");
             }
         } else if (!self.editNameCodepoint(codepoint) and codepoint >= 0x20) {
@@ -2315,50 +2366,136 @@ const App = struct {
             self.render();
             return;
         }
-        copyZ(self.copy_source_path[0..], spanZ(entry.path[0..]));
+        if (!self.guardCurrentEntries()) return;
+        const metadata = switch (fileMetadata(&self.ctx.sys, zptr(&entry.path))) {
+            .found => |value| value,
+            else => {
+                setZ(&self.status, "Source changed or unavailable; copy again");
+                self.render();
+                return;
+            },
+        };
+        if (!std.meta.eql(metadata, entry.metadata) or metadata.flags & r4os.abi.file_metadata2_flag_identity_valid == 0) {
+            setZ(&self.status, "Source identity changed; copy again");
+            self.render();
+            return;
+        }
+        var bytes: [136]u8 = undefined;
+        const payload = clipboard.encodeFile(spanZ(&entry.path), &bytes) catch {
+            setZ(&self.status, "Source path invalid or too long");
+            self.render();
+            return;
+        };
+        var committed: r4os.clipboard_offer.Lease = undefined;
+        const connected = self.clipboard_owner.connect(self.ctx.app);
+        const result = if (connected == 0) self.clipboard_owner.publish(r4os.abi.clipboard_offer_format_file_list, payload, &committed) else connected;
+        if (result != 0) {
+            setZ(&self.status, "Clipboard commit unconfirmed; source retained");
+            self.render();
+            return;
+        }
+        self.copy_source_path = entry.path;
+        self.copy_source_metadata = metadata;
+        self.copy_source_offer = committed;
         self.copy_is_move = move_source;
-        setZ(self.status[0..], if (move_source) "Move source: " else "Copy source: ");
+        setZ(self.status[0..], if (move_source) "Move source " else "Copy source ");
         appendZ(self.status[0..], spanZ(entry.label[0..]));
         self.render();
     }
 
     fn pasteCopied(self: *App) void {
         self.clearPendingDelete();
+        if (!self.guardCurrentEntries()) return;
         if (self.view_mode == .computer) {
             setZ(self.status[0..], "Open a drive before pasting");
             self.render();
             return;
         }
-        const source = spanZ(self.copy_source_path[0..]);
-        if (source.len == 0) {
-            setZ(self.status[0..], "No copy source");
+        var bytes: [136]u8 = undefined;
+        var offered: r4os.clipboard_offer.Lease = undefined;
+        const connected = self.clipboard_owner.connect(self.ctx.app);
+        const count = if (connected == 0) self.clipboard_owner.read(r4os.abi.clipboard_offer_format_file_list, &bytes, &offered) else connected;
+        var source_path: [128]u8 = undefined;
+        const source = if (count > 0) clipboard.decodeFile(bytes[0..@intCast(count)], &source_path) catch null else null;
+        if (source == null) {
+            setZ(&self.status, "Clipboard needs one complete file path");
+            self.render();
+            return;
+        }
+        const source_metadata = switch (fileMetadata(&self.ctx.sys, zptr(&source_path))) {
+            .found => |value| value,
+            else => {
+                setZ(&self.status, "Source changed or unavailable; copy again");
+                self.render();
+                return;
+            },
+        };
+        if (source_metadata.flags & r4os.abi.file_metadata2_flag_identity_valid == 0 or
+            source_metadata.flags & r4os.abi.file_metadata2_flag_directory != 0)
+        {
+            setZ(&self.status, "Clipboard source requires a file identity");
+            self.render();
+            return;
+        }
+        const own_offer = sameOffer(self.copy_source_offer, offered) and equalsIgnoreCase(source.?, spanZ(&self.copy_source_path));
+        if (own_offer and !std.meta.eql(self.copy_source_metadata, source_metadata)) {
+            setZ(&self.status, "Source identity changed; copy again");
             self.render();
             return;
         }
         var target_path: [128]u8 = .{0} ** 128;
-        if (!childPath(spanZ(self.current_path[0..]), tailName(source), target_path[0..])) {
+        if (!childPath(spanZ(self.current_path[0..]), tailName(source.?), target_path[0..])) {
             setZ(self.status[0..], "Target path too long");
             self.render();
             return;
         }
-        const target = spanZ(target_path[0..]);
-        if (equalsIgnoreCase(source, target)) {
+        const target = spanZ(&target_path);
+        if (equalsIgnoreCase(source.?, target)) {
             setZ(self.status[0..], "Cannot paste onto itself");
             self.render();
             return;
         }
-        if (self.ctx.sys.fileInfo(zptr(target_path[0..])) != null and (!self.pending_paste or !equalsIgnoreCase(spanZ(self.pending_paste_target[0..]), target))) {
-            self.pending_paste = true;
-            copyZ(self.pending_paste_target[0..], target);
-            setZ(self.status[0..], "Confirm overwrite: click Paste again");
-            self.render();
-            return;
+        const target_metadata: ?r4os.abi.FileMetadata2 = switch (fileMetadata(&self.ctx.sys, zptr(&target_path))) {
+            .found => |value| value,
+            .missing => null,
+            .failure => {
+                setZ(&self.status, "Target identity unavailable");
+                self.render();
+                return;
+            },
+        };
+        if (target_metadata) |existing| {
+            if (std.meta.eql(existing.identity, source_metadata.identity)) {
+                setZ(&self.status, "Cannot paste onto the same file identity");
+                self.render();
+                return;
+            }
+            if (!self.pending_paste or !equalsIgnoreCase(spanZ(&self.pending_paste_target), target) or
+                !std.meta.eql(self.pending_paste_metadata, target_metadata) or
+                !std.meta.eql(self.pending_paste_source, source_metadata) or !sameOffer(self.pending_paste_offer, offered))
+            {
+                self.pending_paste = true;
+                self.pending_paste_target = target_path;
+                self.pending_paste_metadata = target_metadata;
+                self.pending_paste_source = source_metadata;
+                self.pending_paste_offer = offered;
+                setZ(self.status[0..], "Confirm overwrite by clicking Paste again");
+                self.render();
+                return;
+            }
         }
-        const move_source = self.copy_is_move;
+        const move_source = own_offer and self.copy_is_move;
+        var copied: r4os.file_stream.CopyResult = .{};
         const result = if (move_source)
-            self.ctx.sys.fileMove(zptr(self.copy_source_path[0..]), zptr(target_path[0..]))
-        else
-            self.ctx.sys.fileCopy(zptr(self.copy_source_path[0..]), zptr(target_path[0..]));
+            self.ctx.sys.fileMove(zptr(&source_path), zptr(&target_path))
+        else blk: {
+            // This provider request owns source identity, staging and every
+            // copy chunk together. Keep its synchronous scratch until return.
+            const files = r4os.app_storage.Files{ .sys = self.ctx.sys };
+            var scratch: [16 * 1024]u8 = undefined;
+            copied = files.copy(.{ .ptr = zptr(&source_path), .len = @intCast(source.?.len) }, .{ .ptr = zptr(&target_path), .len = @intCast(target.len) }, &scratch);
+            break :blk if (copied.ok) @as(i32, 1) else copied.error_code;
+        };
         self.clearPendingPaste();
         if (result > 0) {
             if (move_source) self.clearTransferSource();
@@ -2368,6 +2505,7 @@ const App = struct {
             setZ(self.status[0..], if (move_source) "Moved" else "Copied");
         } else {
             self.setFsErrorStatus(if (move_source) .move else .copy, result);
+            if (!move_source and copied.bytes != 0) appendZ(&self.status, ". Inspect partial target");
         }
         self.render();
     }
@@ -2384,11 +2522,16 @@ const App = struct {
 
     fn clearPendingPaste(self: *App) void {
         self.pending_paste = false;
+        self.pending_paste_metadata = null;
+        self.pending_paste_source = .{};
+        self.pending_paste_offer = .{};
         @memset(self.pending_paste_target[0..], 0);
     }
 
     fn clearTransferSource(self: *App) void {
         self.copy_is_move = false;
+        self.copy_source_metadata = .{};
+        self.copy_source_offer = .{};
         @memset(self.copy_source_path[0..], 0);
     }
 
@@ -2945,14 +3088,16 @@ fn runFileSelfTest(ctx: *const r4os.r4sys.Context) i32 {
         if (present) _ = files.delete(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) });
     };
     for (&paths) |*path| {
-        if (files.info(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) }) != .missing) return explorerFail(ctx, "private-path-exists");
+        if (files.metadata(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) }) != .missing) return explorerFail(ctx, "private-path-exists");
     }
     const src_path = &paths[0];
     const copy_path = &paths[1];
     const move_path = &paths[2];
     if (!createProbeFile(files, src_path, "Explorer selftest source\n")) return explorerFail(ctx, "write");
     owned[0] = true;
-    if (ctx.fileCopy(src_path, copy_path) <= 0) return explorerFail(ctx, "copy");
+    var copy_buffer: [16 * 1024]u8 = undefined;
+    const copied = files.copy(.{ .ptr = src_path, .len = @intCast(std.mem.sliceTo(src_path, 0).len) }, .{ .ptr = copy_path, .len = @intCast(std.mem.sliceTo(copy_path, 0).len) }, &copy_buffer);
+    if (!copied.ok or copied.bytes != "Explorer selftest source\n".len) return explorerFail(ctx, "copy");
     owned[1] = true;
     var copied_entry: [128]u8 = .{0} ** 128;
     const copy_name = std.mem.sliceTo(copy_path, 0)["C:\\TEMP\\".len..];
@@ -2982,7 +3127,7 @@ fn runFileSelfTest(ctx: *const r4os.r4sys.Context) i32 {
     owned[3] = false;
     owned[4] = false;
     for ([_]*[128:0]u8{ multi_path_a, multi_path_b }) |path| {
-        if (files.info(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) }) != .missing) return explorerFail(ctx, "multi-delete-residue");
+        if (files.metadata(.{ .ptr = path, .len = @intCast(std.mem.sliceTo(path, 0).len) }) != .missing) return explorerFail(ctx, "multi-delete-residue");
     }
 
     if (!(hasArg(ctx.argsRaw(), "/FILES") and hasArg(ctx.argsRaw(), "/QUIET"))) ctx.println("EXPLORER selftest: OK");
@@ -3396,14 +3541,24 @@ fn decodeIconBytes(
     return .{ .width = image.width, .height = image.height };
 }
 
+fn sameOffer(left: r4os.clipboard_offer.Lease, right: r4os.clipboard_offer.Lease) bool {
+    return left.provider != 0 and left.provider == right.provider and left.revision == right.revision;
+}
+
+fn fileMetadata(sys: *const r4os.r4sys.Context, path: [*:0]const u8) r4os.metadata2.InfoResult {
+    const files = r4os.app_storage.Files{ .sys = sys.* };
+    return files.metadata(.{ .ptr = path, .len = @intCast(std.mem.span(path).len) });
+}
+
 fn findDirectoryEntryPath(ctx: *const r4os.r4sys.Context, directory: [*:0]const u8, name: []const u8, out: []u8) bool {
     if (out.len == 0) return false;
-    var index: u32 = 2;
-    while (true) : (index += 1) {
-        @memset(out, 0);
-        const kind = ctx.dirEntry(directory, index, out[0 .. out.len - 1]);
-        if (kind < 0) return false;
-        if (equalsIgnoreCase(tailName(spanZ(out)), name)) return true;
+    const files = r4os.app_storage.Files{ .sys = ctx.* };
+    var entries = files.iterate(.{ .ptr = directory, .len = @intCast(std.mem.span(directory).len) });
+    while (true) {
+        switch (entries.next(out)) {
+            .entry => |entry| if (equalsIgnoreCase(tailName(entry.path), name)) return true,
+            .end, .failure => return false,
+        }
     }
 }
 
@@ -4083,7 +4238,7 @@ fn runDialogTextSelfTest(ctx: *AppApi) i32 {
         return 1;
     };
     const directory = "C:\\TEMP\\EXPTEXT08543";
-    if (ctx.sys.fileInfo(directory)) |_| return 1;
+    if (fileMetadata(&ctx.sys, directory) != .missing) return 1;
     if (ctx.sys.dirCreate(directory) <= 0) return 1;
     var original: [128]u8 = @splat(0);
     var target: [128]u8 = @splat(0);
@@ -4100,7 +4255,7 @@ fn runDialogTextSelfTest(ctx: *AppApi) i32 {
     if (!app.insertNameText("€🙂.TXT") or !validFileName(app.name_input.value()) or !childPath(directory, app.name_input.value(), &target)) return 1;
     app.name_mode = .rename;
     if (app.executeNameOperation(zptr(&target)) <= 0) return 1;
-    if (ctx.sys.fileInfo(zptr(&original))) |_| return 1;
+    if (fileMetadata(&ctx.sys, zptr(&original)) != .missing) return 1;
     if (ctx.sys.fileRead(zptr(&target), &data) != payload.len or !std.mem.eql(u8, data[0..payload.len], payload)) return 1;
     if (ctx.sys.fileDelete(zptr(&target)) <= 0 or ctx.sys.dirDelete(directory) <= 0) return 1;
     ctx.sys.println("EXPLORER Unicode dialog selftest: OK codepoints=whole paste=exact source=full create=exclusive rename=bytes cleanup=complete");
@@ -4117,12 +4272,36 @@ test "EXPLORER dialog owner keeps full Unicode source and atomic bounded paste" 
 // Exercise the actual published page owner: metadata can reorder a selected
 // item across pages; replacing its on-disk identity must not retain selection.
 test "navigation view owner preserves identity across resort and page boundaries" {
+    var record: r4os.abi.DirectoryMetadataEntry2 = .{
+        .info = .{
+            .flags = r4os.abi.file_metadata2_flag_exists | r4os.abi.file_metadata2_flag_identity_valid | r4os.abi.file_metadata2_flag_byte_size_valid,
+            .identity = .{ .mount_generation = 0x1_0000_0001, .namespace_generation = 0x2_0000_0001, .object_hi = 0x3_0000_0001, .object_lo = 0x4_0000_0001 },
+            .backend_node = 0x5_0000_0001,
+            .byte_size = 0x6_0000_0001,
+            .attributes = 0x7_0001,
+        },
+    };
+    copyZ(&record.path, "C:\\DIR\\WIDE.TXT");
+    const decoded = NavigationModel.item(&record).?;
+    try std.testing.expectEqualDeep(record.info, decoded.metadata);
+    try std.testing.expectEqual(record.info.byte_size, decoded.size);
+    try std.testing.expectEqual(record.info.attributes, decoded.attr);
     const app = try std.testing.allocator.create(App);
     defer std.testing.allocator.destroy(app);
     app.* = .{ .ctx = undefined, .view_mode = .directory, .assoc = r4std.app_assoc.Config.initDefault() };
     defer app.snapshot.deinit(std.testing.allocator);
     for (0..70) |index| {
-        var item = Entry{ .info_valid = true, .first_cluster = @intCast(index + 1), .size = 7 };
+        var item = Entry{
+            .kind = entry_kind_file,
+            .info_valid = true,
+            .size = 7,
+            .metadata = .{
+                .flags = r4os.abi.file_metadata2_flag_identity_valid | r4os.abi.file_metadata2_flag_byte_size_valid,
+                .identity = .{ .mount_generation = 0x1_0000_0001, .namespace_generation = 0x2_0000_0001, .object_hi = 0x3_0000_0001, .object_lo = @as(u64, index) + 0x4_0000_0001 },
+                .backend_node = @as(u64, index) + 0x5_0000_0001,
+                .byte_size = 7,
+            },
+        };
         _ = try std.fmt.bufPrintZ(&item.path, "C:\\DIR\\ITEM{d:0>2}", .{index});
         _ = try std.fmt.bufPrintZ(&item.label, "Item{d:0>2}", .{index});
         try app.snapshot.append(std.testing.allocator, item);
@@ -4146,7 +4325,7 @@ test "navigation view owner preserves identity across resort and page boundaries
     try std.testing.expect(app.has_prev_page and app.selected_index == 5);
     try std.testing.expectEqualStrings(spanZ(&selected.path), spanZ(&app.entries[app.selected_index].path));
     try std.testing.expectEqualStrings("ZZZ metadata title", spanZ(&app.entries[app.selected_index].label));
-    app.snapshot.values.items[69].first_cluster += 1;
+    app.snapshot.values.items[69].metadata.identity.object_hi += 1;
     app.applySnapshotPage(.refresh, selected, true);
     try std.testing.expect(!equalsIgnoreCase(spanZ(&selected.path), spanZ(&app.entries[app.selected_index].path)));
 }

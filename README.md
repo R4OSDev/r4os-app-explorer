@@ -1,4 +1,4 @@
-# EXPLORER.R4X
+﻿# EXPLORER.R4X
 
 `EXPLORER.R4X` is an independent R4OS application implemented in Zig.
 
@@ -26,10 +26,8 @@ magic, their installed catalog entry intentionally requests zero probe bytes;
 the selected R4SNES instance validates the entire cartridge and any firmware
 requirement after launch.
 
-The console `/SELFTEST` path acquires only R4SYS and its imported R4STD
-helpers. It deliberately skips unused GUI, network and device contexts, so
-the association/filesystem diagnostic cannot wait behind unrelated SMP work
-during headless acceptance.
+The console `/SELFTEST` path uses R4SYS and its imported R4STD interfaces.
+Graphical startup acquires the desktop and drawing facades.
 
 `/SELFTEST /FILES` selects the same real copy/move/delete cases without the
 independent subsystem fixtures. Probe paths include the exact process instance
@@ -120,8 +118,8 @@ Shortcut pixel ownership (0.87.45)
 ----------------------------------
 Visible shortcut icons use a64-entry decoded-pixel LRU. Main paints only
 cached pixels or the standard icon. A copied BSP job loads/decodes outside
-painting and is really joined before insertion/free. FileInfo identity and
-exact mount/global-publication cursors guard adoption/invalidation; negative
+painting and is really joined before insertion/free. FileMetadata2 identity and
+exact parent-mount/global-publication cursors guard adoption/invalidation; negative
 results cache too. Unavailable mount/admission waits an explicit refresh.
 No storage inventory or file I/O runs in icon painting; without shortcut
 demand the cache performs no system metadata calls. Pixels are owned, bounded
@@ -133,3 +131,35 @@ Build.sh shortcut-icons-test navigation-test drive-free-test dialog-text-test
 late-result rejection, negative/update/delete/recreate, stale mount token,
 64/65 LRU, oversize standard, copied pixels and cancel/drain. Explicit
 SPECTRA CHECK DESKTOP /HOST /NAV /ICONS covers real product frame resources.
+
+API generation 2 (0.90.66)
+--------------------------
+Explorer uses the normal App2 entry and Query2 platform interfaces selected
+by SDK 0.64.201. R4STD imports include its technical Query2 record and the
+independent settings, date and time interfaces from Libraries 0.64.57.
+
+Directory rows retain the complete FileMetadata2 record, wide identities,
+attributes, sizes and timestamp validity. One joined worker publishes complete
+pages. Main binds its own bounded directory cursor before adopting the copied
+namespace, mount and change facts. A later details worker checks portable
+identity values. Main keeps its cursor for demand-driven validation.
+Shortcut pixels use the actual parent directory and backing-mount identity.
+
+Copy publishes a canonical single-file offer through CLIPSVC. Other Explorer
+instances can consume it. Each instance binds its Cut intent to its committed
+offer revision and source metadata. Overwrite confirmation captures the exact
+source, target and offer observations. A changed target receives a fresh
+confirmation. File copies use the existing complete provider request with its
+own source identity, staging, chunks and completion receipt.
+
+Name dialogs publish UTF8 selections and accept whole snapshot reads after
+release acknowledgement. An unconfirmed commit preserves the editable text
+and its transaction token. The shared checked clock, RPC budget, byte cursor
+and stream transfer helpers carry the finite operation budget and exact bytes.
+The existing 48-byte editable-name and 128-byte path storage budgets apply.
+
+Existing owner tests run through dialog-text-test, navigation-test,
+drive-free-test and shortcut-icons-test. The same-source EXPTEXT fixture
+checks native joins, mutation, cancellation, typed file lists, an exact
+8192-byte UTF8 transfer and acknowledged release. Project-wide evidence and
+qualification are recorded in Docs/API/ConsumerMigration.txt.

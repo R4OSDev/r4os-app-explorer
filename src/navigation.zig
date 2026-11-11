@@ -33,6 +33,7 @@ pub fn Owner(comptime Model: type) type {
             source: []const Model.Item = &.{},
             geometry: abi.DriveInfo = .{},
             watch: abi.DirectoryChangeCursor = .{},
+            namespace_generation: u64 = 0,
             inventory_generation: u64 = 0,
             shortcuts: usize = 0,
             handle: abi.ProgramJoinHandle = .{},
@@ -167,9 +168,18 @@ pub fn Owner(comptime Model: type) type {
             }
             if (job.watch.mount_generation == 0) return false;
             var observed = job.watch;
-            // Conservatively reject any intervening global publication, also
-            // an ancestor rename or mount change outside the watched node.
-            return sys.directoryChangePoll(&observed) == 0 and observed.sequence == job.watch.sequence;
+            const context = sys.base.generation2 orelse return false;
+            if (sys.directoryChangePoll(&observed) != 0 or observed.sequence != job.watch.sequence) return false;
+            // Directory cursors belong to their creating task. Copied epoch
+            // and mount facts can be checked by Main or a fresh details worker.
+            const metadata = switch (r4os.metadata2.info(context, @ptrCast(&job.key.location.path))) {
+                .found => |value| value,
+                else => return false,
+            };
+            return metadata.flags & abi.file_metadata2_flag_identity_valid != 0 and
+                metadata.identity.namespace_generation == job.namespace_generation and
+                metadata.identity.mount_slot == job.watch.mount_slot and
+                metadata.identity.mount_generation == job.watch.mount_generation;
         }
         fn checkpoint(job: *const Job) bool {
             if (job.stopped.load(.acquire)) return false;
@@ -215,21 +225,25 @@ pub fn Owner(comptime Model: type) type {
                     if (!found) return .failed;
                 } else job.geometry = job.sys.driveInfoGeometry(letter - 'A') orelse return .failed;
                 if (job.geometry.mounted == 0 or !Model.browsable(job.geometry.kind)) return .failed;
-                var cursor: abi.DirectoryBatchCursor = .{};
-                var records: [4]abi.DirectoryBatchEntry = undefined;
+                const context = job.sys.base.generation2 orelse return .failed;
+                var directory = r4os.metadata2.Directory.init(context, @ptrCast(&job.key.location.path));
+                var records: [4]abi.DirectoryMetadataEntry2 = undefined;
                 while (true) {
                     if (!checkpoint(job)) return .cancelled;
-                    const raw = job.sys.directoryBatch(@ptrCast(&job.key.location.path), &cursor, &records);
-                    if (raw == -5) break;
-                    if (raw == -10) return .stale;
-                    if (raw < 0 or raw > records.len) return .failed;
-                    for (records[0..@intCast(raw)]) |*record| {
-                        const item = Model.item(record) orelse return .failed;
-                        if (item.is_shortcut) job.shortcuts += 1;
-                        job.snapshot.append(job.sys.allocator(), item) catch return .failed;
+                    switch (directory.next(&records)) {
+                        .end => break,
+                        .progress => continue,
+                        .restart => return .stale,
+                        .failure => return .failed,
+                        .rows => |rows| for (rows) |*record| {
+                            const item = Model.item(record) orelse return .failed;
+                            if (item.is_shortcut) job.shortcuts += 1;
+                            job.snapshot.append(job.sys.allocator(), item) catch return .failed;
+                        },
                     }
                 }
-                job.watch = cursor.change;
+                job.namespace_generation = directory.cursor.namespace_generation;
+                job.watch = directory.cursor.scan.change;
             }
             if (!sort(job)) return .cancelled;
             return if (valid(&job.sys, job)) .ok else .stale;
@@ -349,4 +363,56 @@ test "replacing or cancelling navigation retains an active worker and removes it
     try std.testing.expect(replacement.generation != key.generation);
     owner.cancel(&sys);
     try std.testing.expect(!owner.loading() and owner.busy() and owner.job.? == &job);
+}
+
+test "joined navigation validates portable epochs without adopting a foreign task cursor" {
+    const Peer = struct {
+        var namespace_generation: u64 = 7;
+        var foreign_cursor_calls: usize = 0;
+        fn info(_: [*:0]const u8, output: *abi.FileMetadata2) callconv(.c) i32 {
+            output.* = .{
+                .flags = abi.file_metadata2_flag_exists | abi.file_metadata2_flag_directory | abi.file_metadata2_flag_identity_valid,
+                .identity = .{ .mount_slot = 2, .mount_generation = 0x1_0000_0001, .namespace_generation = namespace_generation },
+            };
+            return 1;
+        }
+        fn poll(_: *abi.DirectoryChangeCursor) callconv(.c) i32 {
+            return 0;
+        }
+        fn foreign(_: ?[*:0]const u8, _: *abi.DirectoryMetadataCursor2, _: ?[*]abi.DirectoryMetadataEntry2, _: u32) callconv(.c) i32 {
+            foreign_cursor_calls += 1;
+            return abi.file_metadata2_error_restart;
+        }
+    };
+    const Model = struct {
+        pub const Item = struct { is_shortcut: bool = false };
+        pub const Config = u8;
+        pub const Location = struct { mode: enum { computer, directory } = .directory, path: [128]u8 = @splat(0) };
+        pub const SortMode = enum { name };
+        pub const HistoryAction = enum { none };
+        pub const PageDirection = enum { first };
+    };
+    const platform = r4os.platform2;
+    var table = platform.abi.R4XStartR4Sys2{ .file_metadata2 = @intFromPtr(&Peer.info), .directory_change_poll = @intFromPtr(&Peer.poll), .directory_metadata_batch2 = @intFromPtr(&Peer.foreign) };
+    const imports = [_]platform.abi.R4XStartImport{.{ .group_id = 1, .resolved_version = 2, .table = @intFromPtr(&table) }};
+    const raw = platform.abi.R4XStartContext2{ .import_count = 1, .imports = @intFromPtr(&imports) };
+    const context = try platform.Context.init(&raw);
+    const sys = Sys.fromProgram(.{ .generation2 = &context });
+    const N = Owner(Model);
+    var job = N.Job{
+        .sys = sys,
+        .key = .{ .location = .{}, .mode = .name, .ascending = true },
+        .config = 0,
+        .watch = .{ .mount_slot = 2, .mount_generation = 0x1_0000_0001, .sequence = 17 },
+        .namespace_generation = 7,
+    };
+    Peer.namespace_generation = 7;
+    Peer.foreign_cursor_calls = 0;
+    try std.testing.expect(N.valid(&sys, &job));
+    Peer.namespace_generation = 8;
+    try std.testing.expect(!N.valid(&sys, &job));
+    Peer.namespace_generation = 7;
+    job.watch.mount_generation += 1;
+    try std.testing.expect(!N.valid(&sys, &job));
+    try std.testing.expectEqual(@as(usize, 0), Peer.foreign_cursor_calls);
 }

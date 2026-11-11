@@ -22,7 +22,12 @@ pub fn build(b: *std.Build) void {
     binding.addImport("r4os", host);
     root.addImport("r4std", binding);
     const cases = b.addTest(.{ .root_module = root, .filters = &.{ "dialog owner", "navigation view owner" } });
-    b.step("dialog-text-test", "Actual Explorer Unicode rename and bounded paste owner").dependOn(&b.addRunArtifact(cases).step);
+    const dialog_test = b.step("dialog-text-test", "Actual Explorer Unicode rename and bounded paste owner");
+    dialog_test.dependOn(&b.addRunArtifact(cases).step);
+    const clipboard_root = b.createModule(.{ .root_source_file = b.path("src/clipboard.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    clipboard_root.addImport("r4os", host);
+    const clipboard_cases = b.addTest(.{ .root_module = clipboard_root });
+    dialog_test.dependOn(&b.addRunArtifact(clipboard_cases).step);
     const free_root = b.createModule(.{ .root_source_file = b.path("src/drive_free.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
     free_root.addImport("r4os", host);
     const free_cases = b.addTest(.{ .root_module = free_root });
