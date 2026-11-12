@@ -3553,11 +3553,26 @@ fn fileMetadata(sys: *const r4os.r4sys.Context, path: [*:0]const u8) r4os.metada
 fn findDirectoryEntryPath(ctx: *const r4os.r4sys.Context, directory: [*:0]const u8, name: []const u8, out: []u8) bool {
     if (out.len == 0) return false;
     const files = r4os.app_storage.Files{ .sys = ctx.* };
-    var entries = files.iterate(.{ .ptr = directory, .len = @intCast(std.mem.span(directory).len) });
-    while (true) {
-        switch (entries.next(out)) {
-            .entry => |entry| if (equalsIgnoreCase(tailName(entry.path), name)) return true,
-            .end, .failure => return false,
+    const context = ctx.base.generation2 orelse return false;
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(context) catch return false;
+    var budget = r4os.rpc_budget.Budget.fromTimeout(clock.read, .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = 2_000_000_000 }) catch return false;
+    restart: while (true) {
+        _ = budget.remainingTicks() catch return false;
+        var entries = files.iterate(.{ .ptr = directory, .len = @intCast(std.mem.span(directory).len) });
+        while (true) {
+            _ = budget.remainingTicks() catch return false;
+            switch (entries.next(out)) {
+                .entry => |entry| if (equalsIgnoreCase(tailName(entry.path), name)) return true,
+                .end => return false,
+                .failure => |code| {
+                    if (code != r4os.abi.file_metadata2_error_restart) return false;
+                    // Other real file probes may change this directory. Drop
+                    // the incomplete readonly view; retain the same deadline
+                    // and every original file/copy/move/delete assertion.
+                    ctx.sleepTicks(1);
+                    continue :restart;
+                },
+            }
         }
     }
 }

@@ -129,3 +129,12 @@ Gemeinsame Zeit-, RPC-, Bytecursor- und Streamhelfer behandeln Frist und
 Bytepraefix. Die bestehenden Speicherbudgets sind 48 Bytes fuer den Namen und
 128 Bytes fuer den Pfad. Lokale und native Belege stehen in
 Docs/API/ConsumerMigration.txt und Research/API-ABI/Migration/0.90.66/.
+
+Read-only-Generationswechsel ab0.1.36
+------------------------------------
+Die bestehenden /SELFTEST /FILES-Proben behalten alle echten Datei-, Copy-,
+Move- und Deletebedingungen. Bei paralleler Namensraumaenderung verwirft
+die reine Verzeichnissuche einen mit restart quittierten unvollstaendigen
+Metadatenscan und beginnt eine frische Sicht innerhalb desselben endlichen
+2s-Budgets. Weder Schreiboperationen noch angenommene Praefixe werden
+wiederholt. Zwei originale parallele Proben gehoeren zur Spectra-/APPS-Abnahme.
