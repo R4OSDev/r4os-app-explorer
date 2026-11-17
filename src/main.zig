@@ -262,17 +262,21 @@ const NavigationModel = struct {
         }
         return entry;
     }
-    pub fn details(sys: *const r4os.r4sys.Context, entry: *Entry) void {
+    pub fn details(sys: *const r4os.r4sys.Context, entry: *Entry) bool {
         entry.shortcut_known = true;
         var bytes: [shortcut_file_max_bytes]u8 = undefined;
         const count = sys.fileRead(zptr(&entry.path), &bytes);
-        if (count <= 0) return;
-        const link = r4std.shortcut.parse(bytes[0..@intCast(count)]) catch return;
-        const resolved = link.resolve() catch return;
+        if (count <= 0) return false;
+        const link = r4std.shortcut.parse(bytes[0..@intCast(count)]) catch return false;
+        const resolved = link.resolve() catch return false;
         entry.shortcut_valid = true;
+        // The title is the only detail used by compareConfigured, including
+        // its secondary name comparison in the other three sort modes.
+        const previous = entry.label;
         if (resolved.title.len != 0) copyZ(&entry.label, resolved.title);
         // File identity must never alias a clipped path. Oversize uses default.
         if (resolved.icon.len != 0 and resolved.icon.len < entry.shortcut_icon.len) copyZ(&entry.shortcut_icon, resolved.icon);
+        return compareTextIgnoreCase(spanZ(&previous), spanZ(&entry.label)) != 0;
     }
     pub fn compare(mode: ThisFileSortMode, ascending: bool, config: *const Config, a: Entry, b: Entry) i8 {
         return compareConfigured(mode, ascending, config, a, b);

@@ -258,12 +258,14 @@ pub fn Owner(comptime Model: type) type {
             }
             // One explicit shortcut read/parse per cooperative step. None of
             // these files gates the first complete base snapshot publication.
+            var order_changed = false;
             for (job.snapshot.values.items) |*item| {
                 if (!item.is_shortcut) continue;
                 if (!checkpoint(job)) return .cancelled;
-                Model.details(&job.sys, item);
+                if (Model.details(&job.sys, item)) order_changed = true;
             }
-            if (!sort(job)) return .cancelled;
+            const completed = if (order_changed) sort(job) else checkpoint(job);
+            if (!completed) return .cancelled;
             return if (valid(&job.sys, job)) .ok else .stale;
         }
         fn less(job: *const Job, a: Model.Item, b: Model.Item) bool {
